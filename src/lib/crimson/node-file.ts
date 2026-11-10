@@ -37,6 +37,7 @@ const chat = z.object({
   mode: z.string().max(80).optional(),
   intro: z.boolean().optional(),
   cut: z.boolean().optional(),
+  note: z.string().max(1000).optional(),
 });
 
 /** Only `files` is required; everything else falls back to the current or default value. */

@@ -24,6 +24,8 @@
  *   OPENROUTER_REASONING_EFFORT   low | medium | high: sent as OpenRouter's
  *                          `reasoning.effort`, so thinking leaves room for the answer
  *   OMNIROUTE_REASONING_EFFORT    the same, sent as `reasoning_effort`
+ *   AI_FALLBACK            "off" to stop chat trying the other providers when
+ *                          the chosen one fails before answering
  */
 import { env } from "@/lib/env.server";
 
@@ -119,6 +121,15 @@ function build(id: ProviderId): ProviderConfig | null {
 
 export function configuredProviders(): ProviderConfig[] {
   return PROVIDER_IDS.map(build).filter((p): p is ProviderConfig => p !== null);
+}
+
+/**
+ * Providers to try for one chat request: the chosen one, then the other
+ * configured ones in PROVIDER_IDS order. AI_FALLBACK=off keeps it to one.
+ */
+export function fallbackOrder(first: ProviderConfig): ProviderConfig[] {
+  if ((env("AI_FALLBACK") ?? "").trim().toLowerCase() === "off") return [first];
+  return [first, ...configuredProviders().filter((provider) => provider.id !== first.id)];
 }
 
 /** Requested provider if configured, else AI_PROVIDER, else the first configured one. */

@@ -28,7 +28,7 @@ const SEED_IDS = new Set(SEED_PERSONALITIES.map((item) => item.id));
 function compose(name: string, voices: string[], focuses: string[]) {
   const who = name.trim() || "this persona";
   const lines = [
-    `You are ${who}, a custom Crimson OS personality.`,
+    `You are ${who}, a custom ToolNeuron mode.`,
     ...VOICES.filter((item) => voices.includes(item.id)).map((item) => item.line),
     ...FOCUSES.filter((item) => focuses.includes(item.id)).map((item) => item.line),
     "Stay with the open file and the question. Do not claim you executed code or rendered an image.",

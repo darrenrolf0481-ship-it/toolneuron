@@ -1,18 +1,19 @@
 import type { ChatInput } from "./chat-input";
 
 export type StreamResult =
-  | { ok: true; text: string; model?: string; /** Hit the token limit mid-reply. */ cut?: boolean }
+  | { ok: true; text: string; model?: string; /** Hit the token limit mid-reply. */ cut?: boolean; /** Another provider answered after the chosen one failed. */ note?: string }
   | { ok: false; text: string; error: string; stopped?: boolean };
 
 /** Streams a reply from /api/chat, calling onDelta with the text so far. Abort the signal to stop. */
 export async function streamChat(
   input: Omit<ChatInput, "messages"> & { messages: { role: string; content: string }[] },
-  { signal, onDelta }: { signal: AbortSignal; onDelta: (textSoFar: string) => void },
+  { signal, onDelta, onNote }: { signal: AbortSignal; onDelta: (textSoFar: string) => void; onNote?: (note: string) => void },
 ): Promise<StreamResult> {
   let text = "";
   let error: string | null = null;
   let model: string | undefined;
   let truncated = false;
+  let note: string | undefined;
   try {
     const response = await fetch("/api/chat", {
       method: "POST",
@@ -43,6 +44,9 @@ export async function streamChat(
         if (event.t === "delta" && typeof event.v === "string") {
           text += event.v;
           onDelta(text);
+        } else if (event.t === "note" && typeof event.v === "string") {
+          note = event.v;
+          onNote?.(event.v);
         } else if (event.t === "error" && typeof event.v === "string") {
           error = event.v;
         } else if (event.t === "done") {
@@ -57,5 +61,5 @@ export async function streamChat(
   }
   if (signal.aborted) return { ok: false, text, error: "Stopped.", stopped: true };
   if (error) return { ok: false, text, error };
-  return { ok: true, text, model, cut: truncated };
+  return { ok: true, text, model, cut: truncated, note };
 }

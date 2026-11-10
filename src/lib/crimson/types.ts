@@ -42,6 +42,8 @@ export type ChatMessage = {
   skills?: string[];
   /** The mode (persona name) that wrote this reply. */
   mode?: string;
+  /** e.g. "Answered by OpenRouter. OmniRoute: rate limit …" (a fallback happened). */
+  note?: string;
   /** Reply ended at the token limit, mid-thought. */
   cut?: boolean;
   /** The app's welcome line: shown, but never sent to the model or handed off. */

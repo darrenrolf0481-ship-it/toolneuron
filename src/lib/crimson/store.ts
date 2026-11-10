@@ -3,8 +3,18 @@ import { askCrimson } from "./ai.functions";
 import { parseImport, wrapExport } from "./node-file";
 import { streamChat } from "./stream-chat";
 import { exportVaultBlob, importVaultBlob } from "./vault/vault-store";
-import { DEFAULT_SKILLS, pickSkills, skillsBlock } from "./skills/catalog";
-import { findHandoff, formatHandoff, HANDOFF_NAME, handoffBlock, labelHistory, stripModeLabel } from "./handoff";
+import { findHandoff, formatHandoff, HANDOFF_NAME, stripModeLabel } from "./handoff";
+import {
+  activePersonality,
+  historyForModel,
+  pickWorkFile,
+  SKILLS_REV,
+  systemPrompt,
+  terminalPrompt,
+  upgradeWelcome,
+  WELCOME,
+  withDefaultSkills,
+} from "./prompt";
 import {
   applyFix,
   idleRun,
@@ -191,66 +201,6 @@ function fresh(): Pick<
   };
 }
 
-function activePersonality(list: Personality[]): Personality {
-  return list.find((item) => item.active) ?? list[0];
-}
-
-const WELCOME = "Neural interface up. Files stay in this browser. Pick a mode in the header, then ask about the open file.";
-/** The welcome line saved before it was mode-neutral (it always claimed Architect). */
-const OLD_WELCOME = "Neural interface up. I am running as the Architect. Files stay in this browser. Ask about the open file, or switch personalities in the header.";
-
-/**
- * The file the AI should treat as the work in progress: the saved choice if it
- * still exists, else the open file, else (when the open file is the note) the
- * first other file.
- */
-function pickWorkFile(files: ProjectFile[], saved: string | undefined, activeFileId: string): string {
-  const note = findHandoff(files)?.id;
-  const usable = (id: string | undefined) => Boolean(id && id !== note && files.some((file) => file.id === id && file.type === "file"));
-  if (usable(saved)) return saved!;
-  if (usable(activeFileId)) return activeFileId;
-  return files.find((file) => file.type === "file" && file.id !== note)?.id ?? "";
-}
-
-/** The pinned handoff note's text (the live draft when it is the open file). */
-function handoffText(state: OsState): string | undefined {
-  const note = findHandoff(state.files);
-  if (!note) return undefined;
-  return note.id === state.activeFileId ? state.draft : note.content;
-}
-
-/**
- * System prompt for one chat message: persona, the skills relevant to this
- * message, the pinned handoff note, armed knowledge, then the open file.
- * Budget ~7,800 chars (server cap 8,000).
- */
-function systemPrompt(state: OsState, message: string): { prompt: string; skills: string[] } {
-  const persona = activePersonality(state.personalities);
-  const open = state.files.find((item) => item.id === state.activeFileId);
-  const note = findHandoff(state.files);
-  // While the handoff note is open, the code being worked on is still the last other file.
-  const noteOpen = Boolean(open && open.id === note?.id);
-  const file = noteOpen ? state.files.find((item) => item.id === state.workFileId && item.type === "file" && item.id !== note?.id) : open;
-  const fileText = file ? (file.id === state.activeFileId ? state.draft || file.content || "" : file.content || "") : "";
-  const armed = state.packs.filter((pack) => pack.armed).slice(0, 2);
-  const knowledge = armed.map((pack) => `${pack.name}: ${pack.excerpt.slice(0, 600)}`).join("\n");
-  const skills = pickSkills(persona.skills, message);
-  const handoff = handoffBlock(handoffText(state));
-  const head = [
-    persona.instruction,
-    "You are inside ToolNeuron, a local neural IDE. Be concrete. Short paragraphs. Fence code with a language tag. Do not claim you executed code or rendered an image. You cannot edit files yourself: the file you are working on is included below when one is open, so answer with the changed code (the whole function or file) for the user to apply. Never start a reply with a [Reply from … mode] tag.",
-    skillsBlock(skills).slice(0, 1600),
-    handoff,
-    knowledge ? `Armed knowledge:\n${knowledge}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-  const room = Math.max(0, 7800 - head.length - 40);
-  const label = noteOpen ? `Working file ${file?.name} (the user has ${HANDOFF_NAME} open in the editor)` : `Open file ${file?.name}`;
-  const code = file && room > 200 ? `${label}:\n${fileText.slice(0, room)}` : "";
-  return { prompt: [head, code].filter(Boolean).join("\n\n"), skills: skills.map((skill) => skill.name) };
-}
-
 function stamp() {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
@@ -297,7 +247,7 @@ export function bootPersistence() {
           .filter((message) => !(message.pending && !message.text))
           .map((message) => (message.pending ? { ...message, pending: false, stopped: true } : message))
           // Older saves hold the welcome line that claimed Architect mode.
-          .map((message) => (message.role === "ai" && (message.intro || message.text === OLD_WELCOME) ? { ...message, text: WELCOME, intro: true } : message)),
+          .map(upgradeWelcome),
         busy: false,
         swarmHot: false,
         booted: true,
@@ -423,28 +373,6 @@ export function importNode(text: string): { ok: true; summary: string } | { ok: 
 
 function setSaveError(message: string) {
   if (useOs.getState().saveError !== message) useOs.setState({ saveError: message });
-}
-
-/**
- * Bumped when built-in modes gain default skills. Rev 1 covered 9 modes;
- * rev 2 added Nightwatch, Lattice and Oracle.
- */
-const SKILLS_REV = 2;
-
-/**
- * Fills in default skills for built-in modes. A save with no skills list
- * (from before skills existed) always gets defaults; an empty list on a
- * built-in mode is refilled only once, when the save predates SKILLS_REV,
- * so a mode the user cleared on purpose stays empty. Custom personas
- * (no defaults) are left as they are.
- */
-function withDefaultSkills(list: Personality[], savedRev: number): Personality[] {
-  return list.map((item) => {
-    const defaults = DEFAULT_SKILLS[item.name];
-    if (!Array.isArray(item.skills)) return { ...item, skills: defaults ?? [] };
-    if (defaults && item.skills.length === 0 && savedRev < SKILLS_REV) return { ...item, skills: defaults };
-    return item;
-  });
 }
 
 function persistable(state: OsState, slim: boolean) {
@@ -738,12 +666,8 @@ export const useOs = create<OsState>((set, get) => ({
     set({ chat: history, busy: true, tab: "toolneuron", module: "chat" });
     try {
       const fileMatch = text.match(/(?:create|generate) (?:a )?(?:new )?file named ([A-Za-z0-9_.-]+)/i);
-      // Drop error notices, and the user turns that only produced an error,
-      // so the model never answers a request the app already refused.
-      const kept = history
-        .filter((message, index) => !message.error && !message.intro && !(message.role === "user" && history[index + 1]?.error))
-        .slice(-8);
-      const messages = labelHistory(kept, activePersonality(get().personalities).name);
+      // See historyForModel: refused turns, notices and the welcome line are left out.
+      const messages = historyForModel(history, activePersonality(get().personalities).name);
       if (fileMatch) {
         messages[messages.length - 1] = {
           role: "user",
@@ -768,7 +692,7 @@ export const useOs = create<OsState>((set, get) => ({
       };
       const result = await streamChat(
         { messages, system: system.prompt, fast: get().fast && !fileMatch, provider: get().provider },
-        { signal: controller.signal, onDelta: (textSoFar) => patchReply({ text: textSoFar }) },
+        { signal: controller.signal, onDelta: (textSoFar) => patchReply({ text: textSoFar }), onNote: (note) => patchReply({ note }) },
       );
       if (chatAbort === controller) chatAbort = null;
 
@@ -851,12 +775,12 @@ export const useOs = create<OsState>((set, get) => ({
     set({ busy: true });
     const persona = activePersonality(get().personalities);
     try {
-      const skills = pickSkills(persona.skills, prompt, 1);
-      if (skills.length) get().pushTerminal([`[SKILL] ${skills.map((skill) => skill.name).join(", ")}`]);
+      const system = terminalPrompt(get(), prompt, get().cwd);
+      if (system.skills.length) get().pushTerminal([`[SKILL] ${system.skills.join(", ")}`]);
       const result = await askCrimson({
         data: {
           messages: [{ role: "user", content: prompt }],
-          system: `${persona.instruction}\n${skillsBlock(skills)}\n${handoffBlock(handoffText(get()), 1200)}\nReply as a terminal specialist in under 80 words. Current directory ${get().cwd}.`,
+          system: system.prompt,
           fast: true,
           provider: get().provider,
         },

@@ -112,6 +112,11 @@ function ChatPane() {
                   {message.text ? <Rich text={message.text} /> : <p className="text-sm text-muted">…</p>}
                   {message.pending && message.text && <span className="os-caret" aria-hidden />}
                   {message.stopped && <p className="mt-1 text-[11px] tracking-wide text-muted uppercase">Stopped</p>}
+                  {message.note && (
+                    <p className="mt-2 text-[11px] leading-4 tracking-wide text-muted" title={message.note}>
+                      {message.note.length > 160 ? `${message.note.slice(0, 160)}…` : message.note}
+                    </p>
+                  )}
                   {message.cut && (
                     <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] tracking-wide text-muted">
                       <span>Cut off at the length limit{fast ? " (Flash is on: shorter replies)" : ""}.</span>
@@ -380,7 +385,7 @@ function HelpPane() {
   return (
     <div className="os-scroll flex-1 space-y-4 overflow-y-auto p-5 text-sm leading-6">
       <h2 className="text-xl font-semibold">Operator guide</h2>
-      <p>Crimson OS keeps the project in this browser. Chat, review, and the terminal's <span className="font-mono">ai</span> command call the AI only when you send them.</p>
+      <p>ToolNeuron keeps the project in this browser. Chat, review, and the terminal's <span className="font-mono">ai</span> command call the AI only when you send them.</p>
       <div className="rounded-3xl border border-border bg-bg p-4">
         <p className="font-semibold">Vault</p>
         <p className="text-muted">Encrypted with your passphrase (AES-256) and kept in this browser only. Optional passkey unlock. There is no recovery if you forget the passphrase.</p>

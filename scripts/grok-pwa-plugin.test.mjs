@@ -17,6 +17,11 @@ import {
   snapshotOgIdentity,
   stripInstallParams,
 } from "./grok-pwa-shared.mjs";
+
+// Tests that do not pass `cwd` read site.json and public/og.* from process.cwd().
+// Run them from an empty folder so they test the plugin, not this app's own
+// share-card config (src/lib/og/site.json sets a title, which wins over <title>).
+process.chdir(mkdtempSync(join(tmpdir(), "grok-pwa-test-cwd-")));
 import { renderInstallPage } from "./grok-pwa-plugin.mjs";
 
 const TEMPLATE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");

@@ -50,7 +50,7 @@ export function interpret(input: string, ctx: TermCtx): { lines: string[]; effec
     const files = ctx.files.filter((file) => file.type === "file").length;
     return {
       lines: [
-        "[SYSTEM] Crimson OS node",
+        "[SYSTEM] ToolNeuron node",
         `[INFO] files ${files}   git ${ctx.git.initialized ? ctx.git.branch : "uninitialized"}   staged ${ctx.git.staged.length}`,
         "[INFO] AI link is user-initiated. Nothing calls out on its own.",
       ],

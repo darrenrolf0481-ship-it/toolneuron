@@ -10,7 +10,6 @@ export function normalizeChatInput(input: unknown): ChatInput {
   const raw = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
   const list = Array.isArray(raw.messages) ? (raw.messages as unknown[]) : [];
   const messages = list
-    .slice(-10)
     .map((item) => {
       const message = (item && typeof item === "object" ? item : {}) as Record<string, unknown>;
       return {
@@ -18,7 +17,9 @@ export function normalizeChatInput(input: unknown): ChatInput {
         content: String(message.content ?? "").slice(0, 6000),
       };
     })
-    .filter((message) => message.content.length > 0);
+    .filter((message) => message.content.length > 0)
+    // Cut after dropping empties, so an empty message never takes a slot.
+    .slice(-10);
   return {
     messages,
     system: String(raw.system ?? "").slice(0, 8000),
@@ -26,6 +27,10 @@ export function normalizeChatInput(input: unknown): ChatInput {
     provider: typeof raw.provider === "string" ? raw.provider.slice(0, 32) : undefined,
   };
 }
+
+/** Appended in Flash mode: short answers stream faster and fit the smaller cap. */
+export const FLASH_RULE =
+  "\n\nFlash mode: answer in under 150 words. Give code only when asked or when the fix needs it, and then only the changed part.";
 
 export const NO_PROVIDER_ERROR =
   "No AI provider is configured. Set OPENROUTER_API_KEY, OMNIROUTE_BASE_URL/OMNIROUTE_API_KEY or XAI_API_KEY.";
@@ -46,7 +51,7 @@ export function completionBody(input: ChatInput, model: string, stream: boolean,
     max_tokens: input.fast ? caps.fast : caps.precise,
     temperature: 0.5,
     stream,
-    messages: [{ role: "system", content: input.system || "You are Crimson OS." }, ...input.messages],
+    messages: [{ role: "system", content: (input.system || "You are ToolNeuron.") + (input.fast ? FLASH_RULE : "") }, ...input.messages],
   };
 }
 

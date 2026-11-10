@@ -3,7 +3,7 @@ import { AuthProvider } from "@/lib/auth/provider";
 import { PreviewHostBridge } from "@/components/preview-host-bridge";
 import appCss from "../styles.css?url";
 
-const APP_NAME = "Crimson OS";
+const APP_NAME = "ToolNeuron";
 
 export const Route = createRootRoute({
   head: () => ({
@@ -14,7 +14,7 @@ export const Route = createRootRoute({
       { name: "theme-color", content: "#7f1d1d" },
       {
         name: "description",
-        content: "Crimson OS — a neural IDE for files, review, and a Grok-linked ToolNeuron hub.",
+        content: "ToolNeuron — a mobile-first AI IDE: chat modes with skills, an editor, sandboxed runners and swarm review.",
       },
     ],
     links: [
