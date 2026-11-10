@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { findFile, interpret, resolvePath, type TermCtx } from "./terminal.ts";
+import { findFile, interpret, parseRepo, resolvePath, type TermCtx, type TermEffect } from "./terminal.ts";
+import { EMPTY_GIT } from "./git.ts";
+import type { GitState } from "./types.ts";
 import type { ProjectFile } from "./types.ts";
 
 const files: ProjectFile[] = [
@@ -49,14 +51,96 @@ describe("cd / ls / cat", () => {
   });
 });
 
-describe("run and git", () => {
+describe("run", () => {
   it("python resolves to a file id", () => {
     assert.deepEqual(interpret("python lib/util.py", ctx(`${ROOT}/project/src`)).effect, { type: "run", fileId: "b", fileName: "util.py" });
     assert.match(interpret("python src", ctx(`${ROOT}/project`)).lines[0], /is a directory/);
   });
-  it("git add by path, status shows names not ids", () => {
-    assert.deepEqual(interpret("git add src/main.py", ctx(`${ROOT}/project`)).effect, { type: "git-add", fileId: "a", name: "main.py" });
-    assert.match(interpret("git status", ctx()).lines[1], /staged: main.py, \(deleted file\)/);
-  });
   it("findFile reports missing files", () => assert.equal(findFile("nope.py", ctx()).ok, false));
+  it("is honest about not being a shell", () => {
+    assert.match(interpret("help", ctx()).lines[0], /not a shell/);
+    assert.match(interpret("rm -rf /", ctx()).lines[0], /not a built-in command/);
+  });
+});
+
+describe("git (real history)", () => {
+  /** Runs commands in sequence, applying git effects and file writes like the app does. */
+  function session(commands: string[], start: ProjectFile[] = files, cwd = `${ROOT}/project`) {
+    let state: GitState = { ...EMPTY_GIT };
+    let current = start.map((file) => ({ ...file }));
+    const out: string[][] = [];
+    for (const command of commands) {
+      const result = interpret(command, { cwd, files: current, git: state });
+      out.push(result.lines);
+      const effect = result.effect as TermEffect | undefined;
+      if (effect?.type === "git") {
+        state = effect.git;
+        for (const write of effect.writes ?? []) current = current.map((file) => (file.id === write.fileId ? { ...file, content: write.content } : file));
+      }
+    }
+    return { out, state, files: current, edit: (id: string, content: string) => (current = current.map((file) => (file.id === id ? { ...file, content } : file))) };
+  }
+
+  it("init, add ., commit, then a clean status and a log entry", () => {
+    const { out, state } = session(["git status", "git init", "git add .", 'git commit -m "first commit"', "git status", "git log"]);
+    assert.match(out[0][0], /Not a repository/);
+    assert.match(out[2].at(-1)!, /staged 4 path/);
+    assert.match(out[3][0], /^\[SUCCESS\] \[main [0-9a-f]{7}\] first commit$/);
+    assert.match(out[4].join("\n"), /working tree clean/);
+    assert.match(out[5][0], /first commit$/);
+    assert.equal(Object.keys(state.commits[0].tree!).length, 4);
+  });
+
+  it("sees edits (including the live draft), diffs them, and restores them", () => {
+    const s = session(["git init", "git add .", 'git commit -m "one"']);
+    const edited = s.files.map((file) => (file.id === "a" ? { ...file, content: "print(2)" } : file));
+    const status = interpret("git status", { cwd: `${ROOT}/project`, files: edited, git: s.state });
+    assert.match(status.lines.join("\n"), /Changes not staged[\s\S]*modified\s+src\/main\.py/);
+    const live = interpret("git diff", { cwd: `${ROOT}/project`, files: s.files, git: s.state, live: { id: "a", content: "print(3)" } });
+    assert.ok(live.lines.includes("-print(1)") && live.lines.includes("+print(3)"), live.lines.join("|"));
+    const restored = interpret("git restore src/main.py", { cwd: `${ROOT}/project`, files: edited, git: s.state });
+    assert.deepEqual((restored.effect as Extract<TermEffect, { type: "git" }>).writes, [{ fileId: "a", content: "print(1)" }]);
+  });
+
+  it("checkout <commit> -- <path> brings back an older version; show prints the commit's diff", () => {
+    const s = session(["git init", "git add .", 'git commit -m "v1"']);
+    const first = s.state.commits[0].id;
+    const edited = s.edit("d", "# changed");
+    const after = interpret("git add README.md", { cwd: `${ROOT}/project`, files: edited, git: s.state });
+    const s2 = (after.effect as Extract<TermEffect, { type: "git" }>).git;
+    const committed = interpret('git commit -m "v2"', { cwd: `${ROOT}/project`, files: edited, git: s2 });
+    const s3 = (committed.effect as Extract<TermEffect, { type: "git" }>).git;
+    const shown = interpret("git show", { cwd: `${ROOT}/project`, files: edited, git: s3 }).lines;
+    assert.ok(shown.includes("-# hi") && shown.includes("+# changed"), shown.join("|"));
+    const back = interpret(`git checkout ${first} -- README.md`, { cwd: `${ROOT}/project`, files: edited, git: s3 });
+    assert.deepEqual((back.effect as Extract<TermEffect, { type: "git" }>).writes, [{ fileId: "d", content: "# hi" }]);
+  });
+
+  it("paths are relative to the cwd, and folders expand", () => {
+    const s = session(["git init", "git add src"], files, `${ROOT}/project`);
+    assert.deepEqual(Object.keys(s.state.index!).sort(), ["src/lib/util.py", "src/main.py"]);
+    const fromSrc = session(["git init", "git add lib/util.py"], files, `${ROOT}/project/src`);
+    assert.deepEqual(Object.keys(fromSrc.state.index!), ["src/lib/util.py"]);
+  });
+
+  it("nothing to commit, unknown paths and remote commands are reported plainly", () => {
+    const { out } = session(["git init", 'git commit -m "empty"', "git add nope.py", "git push", "git checkout main"]);
+    assert.match(out[1][0], /Nothing staged/);
+    assert.match(out[2][0], /did not match any files/);
+    assert.match(out[3][0], /not available: .*no remote/);
+    assert.match(out[4][0], /one branch only/);
+  });
+});
+
+describe("clone", () => {
+  it("parses owner/name and GitHub URLs, refuses the rest", () => {
+    assert.equal(parseRepo("sickn33/agentic-awesome-skills"), "sickn33/agentic-awesome-skills");
+    assert.equal(parseRepo("https://github.com/owner/repo.git"), "owner/repo");
+    assert.equal(parseRepo("ToolNeuron"), null);
+    assert.equal(parseRepo("owner/repo/extra"), null);
+    assert.equal(parseRepo("../etc/passwd"), null);
+    assert.deepEqual(interpret("gh repo clone owner/repo", ctx()).effect, { type: "clone", repo: "owner/repo" });
+    assert.deepEqual(interpret("git clone https://github.com/a/b", ctx()).effect, { type: "clone", repo: "a/b" });
+    assert.match(interpret("gh repo clone ToolNeuron", ctx()).lines[0], /public GitHub repo/);
+  });
 });

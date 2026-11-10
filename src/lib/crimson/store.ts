@@ -4,6 +4,7 @@ import { parseImport, wrapExport } from "./node-file";
 import { streamChat } from "./stream-chat";
 import { exportVaultBlob, importVaultBlob } from "./vault/vault-store";
 import { findHandoff, formatHandoff, HANDOFF_NAME, stripModeLabel } from "./handoff";
+import * as Git from "./git";
 import {
   activePersonality,
   historyForModel,
@@ -102,9 +103,14 @@ export type OsState = {
   setCwd: (cwd: string) => void;
   rememberCommand: (cmd: string) => void;
   gitInit: () => void;
-  gitAdd: (fileId: string) => void;
-  gitCommit: (message: string) => void;
-  cloneRepo: (name: string) => void;
+  /** Stages repo paths ("." for everything). */
+  gitAdd: (paths: string[]) => void;
+  /** Commits the index; false when nothing is staged. */
+  gitCommit: (message: string) => boolean;
+  /** Sets git state and writes restored contents into existing files. */
+  applyGit: (git: GitState, writes?: { fileId: string; content: string }[]) => void;
+  /** Copies a public GitHub repo's text files into the project (owner/name). */
+  cloneRepo: (repo: string) => Promise<void>;
   addPack: (pack: Pack) => void;
   togglePack: (id: string) => void;
   removePack: (id: string) => void;
@@ -126,11 +132,9 @@ export type OsState = {
   resetNode: () => void;
 };
 
-const BOOT_TERMINAL = [
-  "CRIMSON OS  v4.2  KORE",
-  "Kernel link steady. Project mounted.",
-  "Type help.",
-];
+const BOOT_TERMINAL = ["ToolNeuron terminal: built-in commands on the project files (not a shell).", "Type help."];
+/** The first line older saves start their terminal with. */
+const OLD_BOOT_LINE = "CRIMSON OS  v4.2  KORE";
 
 function fresh(): Pick<
   OsState,
@@ -180,7 +184,7 @@ function fresh(): Pick<
         size: "6 rules",
         excerpt:
           "Never interpolate SQL. Never assign untrusted HTML to innerHTML. Do not query inside a loop when a join would do. No bare except. Name things for the next reader. Add type hints on public functions.",
-        status: "indexed",
+        status: "searchable",
         armed: true,
       },
     ],
@@ -194,7 +198,7 @@ function fresh(): Pick<
       { id: "s1", name: "Neural_Architecture_v4.pdf", size: "2.4 MB", type: "pdf", date: "2026-03-20" },
       { id: "s2", name: "System_Directives.md", size: "12 KB", type: "md", date: "2026-04-02" },
     ],
-    git: { initialized: false, branch: "main", staged: [], commits: [] },
+    git: { ...Git.EMPTY_GIT },
     editorMode: "code",
     outputs: {},
     savedAt: "",
@@ -242,6 +246,10 @@ export function bootPersistence() {
         workFileId: pickWorkFile(files, parsed.workFileId, activeFileId),
         // A tab that no longer exists (e.g. the removed Bridge) falls back to the hub.
         tab: TABS.includes(parsed.tab as Tab) ? (parsed.tab as Tab) : base.tab,
+        terminal:
+          Array.isArray(parsed.terminal) && parsed.terminal[0] === OLD_BOOT_LINE ? [...BOOT_TERMINAL, ...parsed.terminal.slice(3)] : (parsed.terminal ?? base.terminal),
+        // Saves from before history was real have commits with no snapshot and no index.
+        git: Git.normalizeGit(parsed.git ?? base.git),
         // A reply that was streaming when the page closed is finished as-is.
         chat: (Array.isArray(parsed.chat) ? parsed.chat : base.chat)
           .filter((message) => !(message.pending && !message.text))
@@ -349,7 +357,7 @@ export function importNode(text: string): { ok: true; summary: string } | { ok: 
     personalities: data.personalities && data.personalities.length > 0 ? withDefaultSkills(data.personalities, 0) : base.personalities,
     chat: data.chat ?? base.chat,
     packs: pick(data.packs, base.packs),
-    git: pick(data.git, base.git),
+    git: Git.normalizeGit(pick(data.git, base.git)),
     storage: pick(data.storage, base.storage),
     swarmMemory: pick(data.swarmMemory, base.swarmMemory),
     theme: data.theme === "dayglass" ? "dayglass" : base.theme,
@@ -578,7 +586,7 @@ export const useOs = create<OsState>((set, get) => ({
       files: template.files,
       activeFileId: first?.id ?? "",
       draft: first?.content ?? "",
-      git: { initialized: false, branch: "main", staged: [], commits: [] },
+      git: { ...Git.EMPTY_GIT },
       editorMode: first?.language === "html" ? "preview" : "code",
       savedAt: stamp(),
     });
@@ -589,59 +597,79 @@ export const useOs = create<OsState>((set, get) => ({
   setCwd: (cwd) => set({ cwd }),
   rememberCommand: (cmd) => set({ termHistory: [cmd, ...get().termHistory].slice(0, 40) }),
 
-  gitInit: () => set({ git: { ...get().git, initialized: true, branch: "main" } }),
-  gitAdd: (fileId) => {
-    const file = get().files.find((item) => item.id === fileId && item.type === "file");
-    if (!file) {
-      get().pushTerminal(["[ERROR] That file is no longer in the project"]);
-      return;
-    }
-    const staged = get().git.staged.includes(file.id) ? get().git.staged : [...get().git.staged, file.id];
-    set({ git: { ...get().git, staged } });
+  gitInit: () => set({ git: Git.init(get().git) }),
+  gitAdd: (paths) => {
+    get().flushDraft();
+    const state = get();
+    set({ git: Git.add(Git.normalizeGit(state.git), Git.workingFiles(state.files), paths).git });
   },
   gitCommit: (message) => {
-    const git = get().git;
-    if (git.staged.length === 0) {
-      get().pushTerminal(["[WARN] Nothing staged."]);
-      return;
-    }
+    get().flushDraft();
+    const next = Git.commit(Git.normalizeGit(get().git), message, new Date().toLocaleString());
+    if (!next) return false;
+    set({ git: next });
+    return true;
+  },
+  applyGit: (git, writes = []) => {
+    const state = get();
+    const byId = new Map(writes.map((write) => [write.fileId, write.content]));
     set({
-      git: {
-        ...git,
-        staged: [],
-        commits: [{ id: Math.random().toString(16).slice(2, 9), message, time: stamp() }, ...git.commits].slice(0, 20),
-      },
+      git,
+      files: byId.size ? state.files.map((file) => (byId.has(file.id) ? { ...file, content: byId.get(file.id) } : file)) : state.files,
+      ...(byId.has(state.activeFileId) ? { draft: byId.get(state.activeFileId)! } : {}),
     });
   },
-
-  cloneRepo: (name) => {
-    const repoName = name.split("/").pop()?.replace(/\.git$/, "") || "repo";
-    const root = `repo_${Date.now()}`;
-    const additions: ProjectFile[] = [
-      { id: root, name: repoName, type: "folder", parentId: "root", isOpen: true },
-      {
-        id: `${root}_readme`,
-        name: "README.md",
-        type: "file",
-        parentId: root,
-        language: "markdown",
-        content: `# ${repoName}\n\nStub cloned on the Crimson node. Wire the real remote when you have one.\n`,
-      },
-      {
-        id: `${root}_main`,
-        name: "main.py",
-        type: "file",
-        parentId: root,
-        language: "python",
-        content: `def main() -> None:\n    print("${repoName} online")\n\nmain()\n`,
-      },
-    ];
-    const parent = get().files.some((file) => file.id === "root") ? "root" : get().files.find((file) => file.parentId === null)?.id;
-    const fixed = additions.map((file) => (file.id === root ? { ...file, parentId: parent ?? null } : file));
-    set({ files: [...get().files.map((file) => (file.id === parent ? { ...file, isOpen: true } : file)), ...fixed] });
+  cloneRepo: async (repo) => {
+    const say = (lines: string[]) => get().pushTerminal(lines);
+    let result: { ok: boolean; error?: string; files?: { path: string; content: string }[]; skipped?: Record<string, number> };
+    try {
+      const response = await fetch("/api/clone", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo }) });
+      result = await response.json();
+    } catch {
+      say(["[ERROR] The clone request failed (network)."]);
+      return;
+    }
+    if (!result.ok || !result.files) {
+      say([`[ERROR] ${result.error ?? "Clone failed."}`]);
+      return;
+    }
+    const state = get();
+    const top = state.files.find((file) => file.parentId === null)?.id ?? "root";
+    const base = repo.split("/")[1];
+    const taken = new Set(state.files.filter((file) => file.parentId === top).map((file) => file.name));
+    let name = base;
+    for (let n = 2; taken.has(name); n++) name = `${base}-${n}`;
+    const stampId = Date.now().toString(36);
+    const folders = new Map<string, string>();
+    const additions: ProjectFile[] = [];
+    const rootId = `clone_${stampId}`;
+    additions.push({ id: rootId, name, type: "folder", parentId: top, isOpen: true });
+    folders.set("", rootId);
+    const folderFor = (dir: string): string => {
+      const known = folders.get(dir);
+      if (known) return known;
+      const parts = dir.split("/");
+      const parent = folderFor(parts.slice(0, -1).join("/"));
+      const id = `${rootId}_d${folders.size}`;
+      additions.push({ id, name: parts[parts.length - 1], type: "folder", parentId: parent, isOpen: false });
+      folders.set(dir, id);
+      return id;
+    };
+    result.files.forEach((item, index) => {
+      const parts = item.path.split("/");
+      const fileName = parts.pop()!;
+      additions.push({ id: `${rootId}_f${index}`, name: fileName, type: "file", parentId: folderFor(parts.join("/")), language: languageFromName(fileName), content: item.content });
+    });
+    set({ files: [...state.files, ...additions] });
+    const skipped = Object.entries(result.skipped ?? {})
+      .filter(([, count]) => count > 0)
+      .map(([reason, count]) => `${count} ${reason.replace(/[A-Z]/g, (c) => ` ${c.toLowerCase()}`)}`);
+    say([
+      `[SUCCESS] Copied ${result.files.length} text file(s) from github.com/${repo} into project/${name}/`,
+      ...(skipped.length ? [`[INFO] left out: ${skipped.join(", ")}`] : []),
+      "[INFO] This is a copy, not a linked clone: there is no remote to pull from or push to.",
+    ]);
   },
-
-
   addPack: (pack) => set({ packs: [pack, ...get().packs] }),
   togglePack: (id) => set({ packs: get().packs.map((pack) => (pack.id === id ? { ...pack, armed: !pack.armed } : pack)) }),
   removePack: (id) => set({ packs: get().packs.filter((pack) => pack.id !== id || pack.id === "doctrine") }),

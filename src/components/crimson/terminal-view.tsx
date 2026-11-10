@@ -6,17 +6,13 @@ import { interpret } from "@/lib/crimson/terminal";
 export function TerminalView() {
   const terminal = useOs((state) => state.terminal);
   const cwd = useOs((state) => state.cwd);
-  const files = useOs((state) => state.files);
-  const git = useOs((state) => state.git);
   const busy = useOs((state) => state.busy);
   const push = useOs((state) => state.pushTerminal);
   const clear = useOs((state) => state.clearTerminal);
   const setCwd = useOs((state) => state.setCwd);
   const remember = useOs((state) => state.rememberCommand);
   const history = useOs((state) => state.termHistory);
-  const gitInit = useOs((state) => state.gitInit);
-  const gitAdd = useOs((state) => state.gitAdd);
-  const gitCommit = useOs((state) => state.gitCommit);
+  const applyGit = useOs((state) => state.applyGit);
   const cloneRepo = useOs((state) => state.cloneRepo);
   const askTerminal = useOs((state) => state.askTerminal);
   const [input, setInput] = useState("");
@@ -34,7 +30,9 @@ export function TerminalView() {
     setCursor(-1);
     setInput("");
     push([`${cwd} $ ${cmd}`]);
-    const result = interpret(cmd, { cwd, files, git });
+    // The open draft is newer than its saved file; git and cat should see it.
+    const now = useOs.getState();
+    const result = interpret(cmd, { cwd, files: now.files, git: now.git, live: now.activeFileId ? { id: now.activeFileId, content: now.draft } : undefined });
     if (result.effect?.type === "clear") {
       clear();
       return;
@@ -43,10 +41,8 @@ export function TerminalView() {
     const effect = result.effect;
     if (!effect) return;
     if (effect.type === "cwd") setCwd(effect.cwd);
-    if (effect.type === "git-init") gitInit();
-    if (effect.type === "git-add") gitAdd(effect.fileId);
-    if (effect.type === "git-commit") gitCommit(effect.message);
-    if (effect.type === "clone") cloneRepo(effect.name);
+    if (effect.type === "git") applyGit(effect.git, effect.writes);
+    if (effect.type === "clone") void cloneRepo(effect.repo);
     if (effect.type === "run") {
       // Save the open editor draft first so the run sees the latest edits.
       useOs.getState().flushDraft();

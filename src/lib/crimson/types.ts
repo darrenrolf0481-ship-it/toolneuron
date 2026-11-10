@@ -54,8 +54,12 @@ export type Pack = {
   id: string;
   name: string;
   size: string;
+  /** First lines, for the card. */
   excerpt: string;
-  status: "indexed" | "cataloged";
+  /** Full text (up to MAX_PACK_CHARS), searched per message; older packs have only the excerpt. */
+  text?: string;
+  /** Legacy labels; packs are searched, not indexed. */
+  status: "indexed" | "cataloged" | "searchable";
   armed: boolean;
 };
 
@@ -75,11 +79,30 @@ export type StorageItem = {
   note?: string;
 };
 
+/** Project path ("src/main.py") → blob hash. See git.ts. */
+export type GitTree = Record<string, string>;
+
+export type GitCommit = {
+  id: string;
+  message: string;
+  time: string;
+  /** The commit before this one. */
+  parent?: string;
+  /** Missing on commits made before history was real (they recorded only a message). */
+  tree?: GitTree;
+};
+
 export type GitState = {
   initialized: boolean;
   branch: string;
+  /** Legacy (file ids staged before history was real); ignored now. */
   staged: string[];
-  commits: { id: string; message: string; time: string }[];
+  /** Newest first. */
+  commits: GitCommit[];
+  /** What the next commit records. */
+  index?: GitTree;
+  /** Hash → contents, for every blob a commit or the index refers to. */
+  blobs?: Record<string, string>;
 };
 
 export type EditorMode = "code" | "preview" | "git";

@@ -21,7 +21,23 @@ that shaped the work, plus the design notes for the swarm and the skills.
   at the token limit (with *Continue*), and say when a fallback provider
   answered.
 - **Code.** Sandboxed JavaScript (iframe + worker, 3 s limit) and Python
-  (Pyodide, 10 s limit), a CodeMirror editor, a terminal, a static analyzer.
+  (Pyodide, 10 s limit), a CodeMirror editor and a static analyzer.
+- **Terminal.** Built-in commands on the project files (`ls`, `cd`, `cat`,
+  `python`, `node`, `ai`, `git`, `gh repo clone`). It is not a shell: other
+  commands are refused.
+- **Git, for real, in the browser.** `git init/status/add/commit/log/diff/
+  show/restore` and `git checkout <commit> -- <path>` work on real snapshots
+  (content-addressed blobs, an index, up to 50 commits). One branch, no
+  remote: push and pull are not available. The editor's Git tab shows the
+  same status and diffs.
+- **Clone public GitHub repos.** `gh repo clone owner/name` downloads the
+  repo's archive on the server and copies its text files into the project
+  (up to 300 files / 1 MB; binaries and `node_modules`-style folders are left
+  out). It is a copy with no link back. Private repos need sign-in, which is
+  not built.
+- **Knowledge packs (Database).** Upload text files (up to 120K characters
+  each); each chat message gets the sections that match it (keyword search),
+  not just the start of the file.
 - **Swarm review.** Three reviewers across providers; findings must quote the
   code; fixes go through a guard and the sandbox before you apply them.
 - **Vault.** Encrypted notes: AES-256-GCM, key wrapped by a passphrase
@@ -63,6 +79,7 @@ Set in `.env`; see `.env.example` and the header of
 | `AI_MAX_TOKENS_FAST`, `AI_MAX_TOKENS` | Reply caps for Flash / Precise (default 420 / 900) |
 | `OPENROUTER_REASONING_EFFORT`, `OMNIROUTE_REASONING_EFFORT` | `low` / `medium` / `high`: keeps a reasoning model's thinking short |
 | `AI_FALLBACK` | `off` stops chat from trying the other providers when the chosen one fails before answering |
+| `CLONE_PER_MIN` | Clones allowed per client per minute (default 4) |
 
 **Free models.** Most free models are reasoning models: they think before
 answering, and the thinking counts against the reply cap. With the default
@@ -109,6 +126,9 @@ check what a real model says. `BASE_URL` overrides the default
 | `src/lib/crimson/providers.server.ts` | Provider config from env |
 | `src/lib/crimson/access.server.ts` | Access key, cookie, rate limits |
 | `src/lib/crimson/runtime.ts`, `python-runtime.ts` | JavaScript and Pyodide sandboxes |
+| `src/lib/crimson/git.ts` | Version history: blobs, index, commits, status, diff (pure, tested) |
+| `src/lib/crimson/knowledge.ts` | Knowledge-pack sections and search (pure, tested) |
+| `src/lib/crimson/tar.ts`, `src/routes/api/clone.ts` | Reading GitHub archives; the clone endpoint |
 | `src/lib/crimson/swarm/` | Swarm review protocol and engine |
 | `src/lib/crimson/vault/` | Vault crypto, passkeys, storage |
 | `src/components/crimson/` | The UI |

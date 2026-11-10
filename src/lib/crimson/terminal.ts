@@ -1,19 +1,22 @@
-import type { GitState, ProjectFile } from "./types";
+import * as Git from "./git.ts";
+import type { GitState, ProjectFile } from "./types.ts";
 
 export type TermEffect =
   | { type: "clear" }
   | { type: "cwd"; cwd: string }
   | { type: "ai"; prompt: string }
-  | { type: "clone"; name: string }
+  /** owner/name of a public GitHub repository. */
+  | { type: "clone"; repo: string }
   | { type: "run"; fileId: string; fileName: string }
-  | { type: "git-init" }
-  | { type: "git-add"; fileId: string; name: string }
-  | { type: "git-commit"; message: string };
+  /** New git state, and file contents to write back (restore / checkout). */
+  | { type: "git"; git: GitState; writes?: { fileId: string; content: string }[] };
 
 export type TermCtx = {
   cwd: string;
   files: ProjectFile[];
   git: GitState;
+  /** The open editor draft, which is newer than its file's saved content. */
+  live?: { id: string; content: string };
 };
 
 const ROOT = "~/crimson-node";
@@ -27,7 +30,7 @@ export function interpret(input: string, ctx: TermCtx): { lines: string[]; effec
   if (cmd === "help") {
     return {
       lines: [
-        "Deck commands",
+        "Built-in commands. This is not a shell: only these run, against the project files.",
         "  help                     this list",
         "  clear                    flush the buffer",
         "  pwd / ls [path] / cd <dir>   walk the node (.. . ~ and a/b paths work)",
@@ -36,8 +39,8 @@ export function interpret(input: string, ctx: TermCtx): { lines: string[]; effec
         "  ai <prompt>              ask the active personality",
         "  python <file>            run real Python 3.14 (Pyodide) in the sandbox",
         "  node <file>              run JavaScript in the isolated sandbox",
-        "  git init|status|add|commit -m \"msg\"",
-        "  gh repo clone <name>     drop a stub repo into the project",
+        "  git ...                  real version history in this browser (git with no args for the list)",
+        "  gh repo clone owner/name copy a public GitHub repo's text files into the project",
         "  echo / date / whoami",
       ],
     };
@@ -74,16 +77,22 @@ export function interpret(input: string, ctx: TermCtx): { lines: string[]; effec
     if (!found.ok) return { lines: [found.error] };
     return { lines: [`[SYSTEM] Launching ${found.file.name}`], effect: { type: "run", fileId: found.file.id, fileName: found.file.name } };
   }
-  if (head === "git") return git(rest, ctx);
-  if (cmd.startsWith("gh repo clone")) {
-    const name = cmd.replace(/^gh repo clone\s+/, "").trim();
-    if (!name) return { lines: ["[ERROR] clone needs a name, e.g. gh repo clone ToolNeuron"] };
-    return {
-      lines: [`Cloning into '${name.split("/").pop()}'…`, "[SUCCESS] Stub landed in the project tree."],
-      effect: { type: "clone", name },
-    };
+  if (cmd.startsWith("gh repo clone") || (head === "git" && rest[0] === "clone")) {
+    const raw = (cmd.startsWith("gh repo clone") ? cmd.replace(/^gh repo clone\s*/, "") : rest.slice(1).join(" ")).trim();
+    const repo = parseRepo(raw);
+    if (!repo) return { lines: ["[ERROR] clone needs a public GitHub repo: gh repo clone owner/name (or its https://github.com/... URL)"] };
+    return { lines: [`Cloning ${repo} from GitHub…`], effect: { type: "clone", repo } };
   }
-  return { lines: [`[LOG] '${head}' is not on this deck. Try help.`] };
+  if (head === "git") return git(rest, ctx);
+  return { lines: [`[LOG] '${head}' is not a built-in command (this terminal is not a shell). Try help.`] };
+}
+
+/** "owner/name", "owner/name.git" or a github.com URL → "owner/name"; null if it is not one. */
+export function parseRepo(raw: string): string | null {
+  const text = raw.trim().replace(/^https?:\/\/(www\.)?github\.com\//i, "").replace(/\.git$/i, "").replace(/\/+$/, "");
+  const match = text.match(/^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})$/);
+  if (!match || match[2] === "." || match[2] === "..") return null;
+  return `${match[1]}/${match[2]}`;
 }
 
 // ---------- paths ----------
@@ -216,36 +225,176 @@ function catFile(target: string, ctx: TermCtx): string[] {
   return (found.file.content ?? "").split("\n");
 }
 
+// ---------- git (real history, kept in the browser; see git.ts) ----------
+
+const GIT_HELP = [
+  "git init | status | add <path>|. | commit -m \"msg\"",
+  "git log [-n N] | diff [--staged] [path] | show [commit]",
+  "git restore [--staged] <path> | checkout <commit> -- <path>",
+  "One branch, history in this browser, no remote (push/pull are not available).",
+];
+
+/** Turns a terminal path argument into repo paths ("src/main.py"); a folder expands to the files under it. */
+function repoPaths(arg: string, ctx: TermCtx, known: string[]): string[] {
+  const segments = resolvePath(ctx.cwd, arg.replace(/\/+$/, "") || ".");
+  let path: string;
+  if (segments && segments[0] === "project") path = segments.slice(1).join("/");
+  else if (segments && segments.length === 0) path = "";
+  else path = arg.replace(/^\.\//, "").replace(/^project\//, "").replace(/\/+$/, "");
+  if (path === "" || path === ".") return ["."];
+  const under = known.filter((item) => item.startsWith(`${path}/`));
+  return under.length > 0 ? under : [path];
+}
+
+function changeLines(changes: Git.Change[], indent = "  "): string[] {
+  return changes.map((change) => `${indent}${change.kind.padEnd(9)}${change.path}`);
+}
+
+function fileIdFor(path: string, ctx: TermCtx): string | undefined {
+  return ctx.files.find((file) => file.type === "file" && Git.pathOf(file, ctx.files) === path)?.id;
+}
+
 function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffect } {
+  const repo = Git.normalizeGit(ctx.git);
   const sub = args[0];
+  const work = () => Git.workingFiles(ctx.files, ctx.live);
+  if (!sub) return { lines: GIT_HELP };
   if (sub === "init") {
-    if (ctx.git.initialized) return { lines: ["[WARN] Repository already initialized."] };
-    return { lines: ["[SUCCESS] Initialized empty repository on main."], effect: { type: "git-init" } };
+    if (repo.initialized) return { lines: ["[WARN] Repository already initialized."] };
+    return { lines: ["[SUCCESS] Initialized empty repository on main (history stays in this browser)."], effect: { type: "git", git: Git.init(repo) } };
   }
-  if (!ctx.git.initialized && sub) return { lines: ["[ERROR] Not a repository. Run git init."] };
+  if (!repo.initialized) return { lines: ["[ERROR] Not a repository. Run git init."] };
+
   if (sub === "status") {
+    const state = Git.status(repo, work());
+    const head = Git.headCommit(repo);
+    const lines = [`On branch ${repo.branch}${head ? `, last commit ${head.id} ${head.message}` : ", no commits yet"}`];
+    if (state.staged.length) lines.push("Changes to be committed:", ...changeLines(state.staged));
+    if (state.unstaged.length) lines.push("Changes not staged (git add <path>):", ...changeLines(state.unstaged));
+    if (state.untracked.length) lines.push("Untracked files (git add <path>):", ...state.untracked.map((path) => `  ${path}`));
+    if (lines.length === 1) lines.push("nothing to commit, working tree clean");
+    return { lines };
+  }
+
+  if (sub === "add") {
+    const targets = args.slice(1).filter((arg) => arg !== "-A" && arg !== "--all");
+    if (targets.length === 0 && args.length === 1) return { lines: ["[ERROR] git add <path> (or . for everything)"] };
+    const current = work();
+    const known = [...new Set([...Object.keys(current), ...Object.keys(repo.index ?? {})])];
+    const paths = targets.length === 0 ? ["."] : targets.flatMap((arg) => repoPaths(arg, ctx, known));
+    const result = Git.add(repo, current, paths);
+    const lines = result.missing.map((path) => `[ERROR] pathspec '${path}' did not match any files`);
+    lines.push(result.added.length ? `[SUCCESS] staged ${result.added.length} path(s): ${result.added.slice(0, 6).join(", ")}${result.added.length > 6 ? ", …" : ""}` : "[INFO] nothing new to stage");
+    return { lines, effect: { type: "git", git: result.git } };
+  }
+
+  if (sub === "commit") {
+    const message = args.slice(1).join(" ").replace(/^-m\s*/, "").replace(/^["']|["']$/g, "").trim();
+    if (!message) return { lines: ['[ERROR] git commit -m "message"'] };
+    const next = Git.commit(repo, message, new Date().toLocaleString());
+    if (!next) return { lines: ["[WARN] Nothing staged. git add <path> first (git status shows what changed)."] };
+    const made = next.commits[0];
+    const count = Git.compareTrees(Git.headTree(repo), made.tree ?? {}).length;
+    return { lines: [`[SUCCESS] [${repo.branch} ${made.id}] ${message}`, `  ${count} file(s) changed`], effect: { type: "git", git: next } };
+  }
+
+  if (sub === "log") {
+    const n = Number(args[args.indexOf("-n") + 1]) || (args.find((arg) => /^-\d+$/.test(arg)) ? Number(args.find((arg) => /^-\d+$/.test(arg))!.slice(1)) : 10);
+    if (repo.commits.length === 0) return { lines: ["[INFO] no commits yet"] };
     return {
-      lines: [
-        `On branch ${ctx.git.branch}`,
-        ctx.git.staged.length
-          ? `staged: ${ctx.git.staged.map((id) => ctx.files.find((file) => file.id === id)?.name ?? "(deleted file)").join(", ")}`
-          : "nothing staged",
-        `${ctx.git.commits.length} local commit(s)`,
-      ],
+      lines: repo.commits.slice(0, n).map((commit) => `${commit.id}  ${commit.time}  ${commit.message}${commit.tree ? "" : "  (no snapshot: made before history was real)"}`),
     };
   }
-  if (sub === "add") {
-    const name = args[1];
-    if (!name) return { lines: ["[ERROR] git add needs a file name"] };
-    const found = findFile(name, ctx);
-    if (!found.ok) return { lines: [found.error] };
-    return { lines: [`[SUCCESS] staged ${found.file.name}`], effect: { type: "git-add", fileId: found.file.id, name: found.file.name } };
+
+  if (sub === "diff") {
+    const staged = args.includes("--staged") || args.includes("--cached");
+    const pathArgs = args.slice(1).filter((arg) => !arg.startsWith("--"));
+    const current = work();
+    const index = repo.index ?? {};
+    const from = staged ? Git.headTree(repo) : index;
+    const changes = staged ? Git.compareTrees(from, index) : Git.status(repo, current).unstaged;
+    const known = changes.map((change) => change.path);
+    const wanted = pathArgs.length ? new Set(pathArgs.flatMap((arg) => repoPaths(arg, ctx, known))) : null;
+    const lines: string[] = [];
+    for (const change of changes) {
+      if (wanted && !wanted.has(".") && !wanted.has(change.path)) continue;
+      const before = Git.blob(repo, from[change.path]);
+      const after = staged ? Git.blob(repo, index[change.path]) : current[change.path];
+      lines.push(...Git.diffText(change.path, before, after));
+    }
+    return { lines: lines.length ? lines : [staged ? "[INFO] nothing staged" : "[INFO] no unstaged changes (try git diff --staged)"] };
   }
-  if (sub === "commit") {
-    const message = args.slice(1).join(" ").replace(/^-m\s*/, "").replace(/^"|"$/g, "");
-    if (!message) return { lines: ['[ERROR] git commit -m "message"'] };
-    if (ctx.git.staged.length === 0) return { lines: ["[WARN] Nothing staged."] };
-    return { lines: [`[SUCCESS] ${message}`], effect: { type: "git-commit", message } };
+
+  if (sub === "show") {
+    const commit = Git.findCommit(repo, args[1] ?? "HEAD");
+    if (!commit) return { lines: [`[ERROR] unknown commit '${args[1] ?? "HEAD"}'`] };
+    const lines = [`commit ${commit.id}`, `Date:   ${commit.time}`, "", `    ${commit.message}`, ""];
+    if (!commit.tree) return { lines: [...lines, "(no snapshot: made before history was real)"] };
+    const parent = commit.parent ? repo.commits.find((item) => item.id === commit.parent)?.tree ?? {} : {};
+    for (const change of Git.compareTrees(parent, commit.tree)) {
+      lines.push(...Git.diffText(change.path, Git.blob(repo, parent[change.path]), Git.blob(repo, commit.tree[change.path])));
+    }
+    return { lines };
   }
-  return { lines: ["[ERROR] git init | status | add <file> | commit -m \"msg\""] };
+
+  if (sub === "restore") {
+    const staged = args.includes("--staged");
+    const targets = args.slice(1).filter((arg) => !arg.startsWith("--"));
+    if (targets.length === 0) return { lines: ["[ERROR] git restore [--staged] <path>"] };
+    const index = repo.index ?? {};
+    const known = [...new Set([...Object.keys(work()), ...Object.keys(index), ...Object.keys(Git.headTree(repo))])];
+    const paths = targets.flatMap((arg) => repoPaths(arg, ctx, known)).flatMap((path) => (path === "." ? known : [path]));
+    if (staged) {
+      const next = paths.reduce((state, path) => Git.unstage(state, path), repo);
+      return { lines: [`[SUCCESS] unstaged ${paths.length} path(s)`], effect: { type: "git", git: next } };
+    }
+    return writeBack(repo, repo, paths, index, ctx, "restored from the index");
+  }
+
+  if (sub === "checkout") {
+    const dash = args.indexOf("--");
+    if (dash !== 2) return { lines: ["[ERROR] git checkout <commit> -- <path>   (one branch only: switching branches is not available)"] };
+    const commit = Git.findCommit(repo, args[1]);
+    if (!commit) return { lines: [`[ERROR] unknown commit '${args[1]}'`] };
+    if (!commit.tree) return { lines: [`[ERROR] ${commit.id} has no snapshot (made before history was real)`] };
+    const tree = commit.tree;
+    const paths = args.slice(3).flatMap((arg) => repoPaths(arg, ctx, Object.keys(tree))).flatMap((path) => (path === "." ? Object.keys(tree) : [path]));
+    if (paths.length === 0) return { lines: ["[ERROR] git checkout <commit> -- <path>"] };
+    const index = { ...(repo.index ?? {}) };
+    for (const path of paths) if (path in tree) index[path] = tree[path];
+    return writeBack(repo, { ...repo, index }, paths, tree, ctx, `checked out from ${commit.id}`);
+  }
+
+  if (sub === "push" || sub === "pull" || sub === "fetch" || sub === "remote" || sub === "branch" || sub === "switch" || sub === "merge") {
+    return { lines: [`[INFO] git ${sub} is not available: history lives in this browser, on one branch, with no remote.`] };
+  }
+  return { lines: GIT_HELP };
+}
+
+/** Writes the contents `source` holds for `paths` back into project files that still exist. */
+function writeBack(
+  repo: GitState,
+  next: GitState,
+  paths: string[],
+  source: Git.Tree,
+  ctx: TermCtx,
+  verb: string,
+): { lines: string[]; effect?: TermEffect } {
+  const writes: { fileId: string; content: string }[] = [];
+  const lines: string[] = [];
+  for (const path of paths) {
+    const content = Git.blob(repo, source[path]);
+    if (content === undefined) {
+      lines.push(`[ERROR] ${path} is not in that version`);
+      continue;
+    }
+    const fileId = fileIdFor(path, ctx);
+    if (!fileId) {
+      lines.push(`[ERROR] ${path} no longer exists in the project; create an empty file there first, then restore`);
+      continue;
+    }
+    writes.push({ fileId, content });
+  }
+  if (writes.length) lines.unshift(`[SUCCESS] ${writes.length} file(s) ${verb}`);
+  return { lines, effect: writes.length || next !== repo ? { type: "git", git: next, writes } : undefined };
 }

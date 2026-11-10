@@ -5,6 +5,7 @@ import { CodeEditor } from "./code-editor";
 import { TEMPLATES } from "@/lib/crimson/seed";
 import { useOs } from "@/lib/crimson/store";
 import type { ProjectFile } from "@/lib/crimson/types";
+import { GitPanel } from "./git-panel";
 
 export function EditorView() {
   const files = useOs((state) => state.files);
@@ -18,13 +19,8 @@ export function EditorView() {
   const setOutput = useOs((state) => state.setOutput);
   const savedAt = useOs((state) => state.savedAt);
   const saveError = useOs((state) => state.saveError);
-  const git = useOs((state) => state.git);
-  const gitInit = useOs((state) => state.gitInit);
-  const gitAdd = useOs((state) => state.gitAdd);
-  const gitCommit = useOs((state) => state.gitCommit);
   const [treeOpen, setTreeOpen] = useState(false);
   const [templatesOpen, setTemplatesOpen] = useState(false);
-  const [commitMsg, setCommitMsg] = useState("");
   const [running, setRunning] = useState(false);
   const [wrap, setWrap] = useState(true);
   const active = files.find((file) => file.id === activeFileId);
@@ -124,54 +120,7 @@ export function EditorView() {
           <iframe title="HTML preview" sandbox="" srcDoc={previewDoc} className="min-h-0 flex-1 bg-bg" />
         )}
 
-        {mode === "git" && (
-          <div className="os-scroll flex-1 space-y-4 overflow-y-auto p-4">
-            <p className="text-sm text-muted">{git.initialized ? `On ${git.branch}` : "No repository yet."}</p>
-            {!git.initialized ? (
-              <button type="button" onClick={gitInit} className="min-h-11 rounded-2xl bg-primary px-4 text-sm font-semibold text-on-primary">
-                git init
-              </button>
-            ) : (
-              <>
-                <button
-                  type="button"
-                  onClick={() => active && gitAdd(active.id)}
-                  className="min-h-11 rounded-2xl border border-border px-4 text-sm"
-                >
-                  Stage {active?.name}
-                </button>
-                <form
-                  className="flex gap-2"
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                    if (!commitMsg.trim()) return;
-                    gitCommit(commitMsg.trim());
-                    setCommitMsg("");
-                  }}
-                >
-                  <input
-                    value={commitMsg}
-                    onChange={(event) => setCommitMsg(event.target.value)}
-                    placeholder="Commit message"
-                    className="min-h-11 flex-1 rounded-2xl border border-border bg-bg px-3 text-sm outline-none"
-                  />
-                  <button type="submit" className="min-h-11 rounded-2xl bg-primary px-4 text-sm font-semibold text-on-primary">
-                    Commit
-                  </button>
-                </form>
-                <p className="text-xs text-muted">Staged: {git.staged.length ? git.staged.map((id) => files.find((file) => file.id === id)?.name ?? id).join(", ") : "nothing"}</p>
-                <ul className="space-y-2">
-                  {git.commits.map((commit) => (
-                    <li key={commit.id} className="rounded-2xl border border-border bg-surface px-3 py-2 text-sm">
-                      <span className="font-mono text-xs text-primary">{commit.id}</span> {commit.message}
-                      <span className="block text-xs text-muted">{commit.time}</span>
-                    </li>
-                  ))}
-                </ul>
-              </>
-            )}
-          </div>
-        )}
+        {mode === "git" && <GitPanel />}
 
         {output && mode === "code" && (
           <pre className="os-scroll max-h-40 overflow-auto border-t border-border bg-surface px-4 py-3 font-mono text-xs leading-5 text-muted whitespace-pre-wrap">

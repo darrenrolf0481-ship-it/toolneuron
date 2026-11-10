@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { analyzeSource } from "@/lib/crimson/analyze";
 import { findHandoff, handoffFrom } from "@/lib/crimson/handoff";
+import { MAX_PACK_CHARS, packText, sections } from "@/lib/crimson/knowledge";
 import { useOs } from "@/lib/crimson/store";
 import type { Module } from "@/lib/crimson/types";
 import { Rich } from "./rich";
@@ -279,7 +280,9 @@ function KnowledgePane() {
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h2 className="text-xl font-semibold">Knowledge packs</h2>
-          <p className="mt-1 text-sm text-muted">Armed packs are pasted into the next chat, capped. Text files only.</p>
+          <p className="mt-1 text-sm text-muted">
+            Text files, split into sections. Each chat message gets the sections of armed packs that match it (keyword search, up to about 1,800 characters). Up to {Math.round(MAX_PACK_CHARS / 1000)}K characters per file.
+          </p>
         </div>
         <label className="min-h-11 cursor-pointer rounded-2xl bg-primary px-4 py-3 text-sm font-semibold text-on-primary">
           Inject text
@@ -291,13 +294,15 @@ function KnowledgePane() {
               const file = event.target.files?.[0];
               event.target.value = "";
               if (!file) return;
-              const excerpt = (await file.text()).slice(0, 4000);
+              const full = await file.text();
+              const text = full.slice(0, MAX_PACK_CHARS);
               addPack({
                 id: `pack_${Date.now()}`,
                 name: file.name,
-                size: `${Math.max(1, Math.round(file.size / 1024))} KB`,
-                excerpt,
-                status: "indexed",
+                size: `${Math.max(1, Math.round(file.size / 1024))} KB${full.length > text.length ? `, first ${Math.round(MAX_PACK_CHARS / 1000)}K chars kept` : ""}`,
+                excerpt: text.slice(0, 400),
+                text,
+                status: "searchable",
                 armed: true,
               });
             }}
@@ -309,7 +314,7 @@ function KnowledgePane() {
           <article key={pack.id} className="rounded-3xl border border-border bg-bg p-4">
             <p className="font-semibold">{pack.name}</p>
             <p className="mt-1 text-xs text-muted">
-              {pack.size} · {pack.status} · {pack.armed ? "armed" : "sheathed"}
+              {pack.size} · {sections(packText(pack)).length} section(s), searched per message · {pack.armed ? "armed" : "sheathed"}
             </p>
             <p className="mt-3 line-clamp-3 text-sm text-muted">{pack.excerpt}</p>
             <div className="mt-3 flex gap-2">

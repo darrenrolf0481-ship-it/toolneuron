@@ -5,6 +5,7 @@
  * (prompt.test.ts) without the store or a browser.
  */
 import { findHandoff, HANDOFF_NAME, handoffBlock, labelHistory } from "./handoff.ts";
+import { knowledgeBlock, retrieve } from "./knowledge.ts";
 import { DEFAULT_SKILLS, pickSkills, skillsBlock } from "./skills/catalog.ts";
 import type { ChatMessage, Pack, Personality, ProjectFile } from "./types.ts";
 
@@ -64,7 +65,8 @@ export function handoffText(state: Pick<PromptState, "files" | "activeFileId" | 
 
 /**
  * System prompt for one chat message: persona, base rules, the skills
- * relevant to this message, the pinned handoff note, armed knowledge, then
+ * relevant to this message, the pinned handoff note, the knowledge-pack
+ * sections that match this message, then
  * the file being worked on (cut to what is left of the budget).
  */
 export function systemPrompt(state: PromptState, message: string): { prompt: string; skills: string[] } {
@@ -75,15 +77,14 @@ export function systemPrompt(state: PromptState, message: string): { prompt: str
   const noteOpen = Boolean(open && open.id === note?.id);
   const file = noteOpen ? state.files.find((item) => item.id === state.workFileId && item.type === "file" && item.id !== note?.id) : open;
   const fileText = file ? (file.id === state.activeFileId ? state.draft || file.content || "" : file.content || "") : "";
-  const armed = state.packs.filter((pack) => pack.armed).slice(0, 2);
-  const knowledge = armed.map((pack) => `${pack.name}: ${pack.excerpt.slice(0, 600)}`).join("\n");
+  const knowledge = knowledgeBlock(retrieve(state.packs, message));
   const skills = pickSkills(persona?.skills, message);
   const head = [
     persona?.instruction ?? "",
     BASE_RULES,
     skillsBlock(skills).slice(0, 1600),
     handoffBlock(handoffText(state)),
-    knowledge ? `Armed knowledge:\n${knowledge}` : "",
+    knowledge,
   ]
     .filter(Boolean)
     .join("\n\n");

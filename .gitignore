@@ -11,3 +11,4 @@ dist/
 .node_modules.lock
 # Raw upload archive from the Grok export, not app source
 attachments/
+.vercel/
