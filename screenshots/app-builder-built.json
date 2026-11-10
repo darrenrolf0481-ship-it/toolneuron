@@ -1,0 +1,41 @@
+{
+  "url": "http://127.0.0.1:8081/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Crimson OS",
+      "hasCanvas": false,
+      "bodyTextLen": 459,
+      "bodyTextHash": "7c6ad6a2a68d14f81d7e99065f3c74f15aa1887d82c271b511b6c8e01a7bc932",
+      "bodyTextPrefix": "TOOLNEURON Persona Architect Syntax-Prime Vanguard Aegis HackMen",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Crimson OS",
+      "hasCanvas": false,
+      "bodyTextLen": 486,
+      "bodyTextHash": "ee87bf9adb0738dcdf477c8db9338d921f7097f9a6c02e40a57a169e7fd010b0",
+      "bodyTextPrefix": "TOOLNEURON Architect Syntax-Prime Vanguard Aegis HackMentor Data",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-built.json",
+  "divergesFromBaseline": true,
+  "baselineReasons": [
+    "desktop: body text changed (386 -> 459 chars, hash mismatch)",
+    "mobile: body text changed (364 -> 486 chars, hash mismatch)"
+  ]
+}

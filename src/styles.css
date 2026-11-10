@@ -1,0 +1,136 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #050102;
+  --color-surface: #140406;
+  --color-surface-2: #1c090c;
+  --color-fg: #fecaca;
+  --color-muted: #a85a5a;
+  --color-primary: #dc2626;
+  --color-on-primary: #fff7f7;
+  --color-border: #4a1519;
+  --color-ember: #7f1d1d;
+  --font-sans: "Sora", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, sfmono-regular, monospace;
+  --radius: 1rem;
+}
+
+[data-theme="dayglass"] {
+  --color-bg: #f6efe9;
+  --color-surface: #fff8f4;
+  --color-surface-2: #f3e4dc;
+  --color-fg: #3b1214;
+  --color-muted: #8a534c;
+  --color-primary: #b91c1c;
+  --color-on-primary: #fff7f7;
+  --color-border: #e4cfc6;
+  --color-ember: #9f1239;
+}
+
+@layer base {
+  html,
+  body {
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--color-primary) 45%, transparent);
+  }
+}
+
+.os-grid {
+  background-image:
+    linear-gradient(to right, color-mix(in srgb, var(--color-primary) 10%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in srgb, var(--color-primary) 10%, transparent) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+.os-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-ember) transparent;
+}
+
+@keyframes os-pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.os-pulse {
+  animation: os-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes os-scan {
+  0% {
+    top: 12%;
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  100% {
+    top: 82%;
+    opacity: 0;
+  }
+}
+
+.os-scan {
+  animation: os-scan 1.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .os-pulse,
+  .os-scan {
+    animation: none;
+  }
+}
+
+/* Syntax colors for the code editor (code-editor.tsx). */
+:root {
+  --syn-keyword: #ff7b72;
+  --syn-string: #fbbf24;
+  --syn-number: #fb923c;
+  --syn-comment: #9a6b6b;
+  --syn-function: #f9a8d4;
+  --syn-type: #d8b4fe;
+  --syn-property: #fecdd3;
+  --syn-punct: #e5a3a3;
+}
+[data-theme="dayglass"] {
+  --syn-keyword: #b91c1c;
+  --syn-string: #92400e;
+  --syn-number: #c2410c;
+  --syn-comment: #86695f;
+  --syn-function: #9d174d;
+  --syn-type: #7e22ce;
+  --syn-property: #7f1d1d;
+  --syn-punct: #6b3a36;
+}
+
+/* Streaming reply caret (hub chat). */
+.os-caret {
+  display: inline-block;
+  width: 0.5em;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  background: var(--color-primary);
+  animation: os-caret 1s steps(1) infinite;
+}
+@keyframes os-caret {
+  50% {
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .os-caret {
+    animation: none;
+  }
+}

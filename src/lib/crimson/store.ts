@@ -1,0 +1,891 @@
+import { create } from "zustand";
+import { askCrimson } from "./ai.functions";
+import { parseImport, wrapExport } from "./node-file";
+import { streamChat } from "./stream-chat";
+import { exportVaultBlob, importVaultBlob } from "./vault/vault-store";
+import { DEFAULT_SKILLS, pickSkills, skillsBlock } from "./skills/catalog";
+import { findHandoff, formatHandoff, HANDOFF_NAME, handoffBlock, labelHistory, stripModeLabel } from "./handoff";
+import {
+  applyFix,
+  idleRun,
+  runFix,
+  runReview,
+  stopSwarm,
+  undoFix,
+  type SwarmFix,
+  type SwarmMemory,
+  type SwarmRun,
+  type SwarmUndo,
+} from "./swarm/engine";
+import { languageFromName, SEED_FILES, SEED_PERSONALITIES, TEMPLATES } from "./seed";
+import type {
+  ChatMessage,
+  EditorMode,
+  GitState,
+  Module,
+  Pack,
+  Personality,
+  ProjectFile,
+  StorageItem,
+  SwarmLog,
+  Tab,
+} from "./types";
+
+const KEY = "crimson_os_v1";
+
+export type OsState = {
+  booted: boolean;
+  tab: Tab;
+  theme: "night" | "dayglass";
+  module: Module;
+  personalities: Personality[];
+  fast: boolean;
+  provider: string;
+  files: ProjectFile[];
+  activeFileId: string;
+  /** The last file opened other than handoff.md; still sent to the AI while the note is open. */
+  workFileId: string;
+  draft: string;
+  chat: ChatMessage[];
+  packs: Pack[];
+  swarmAnxiety: number;
+  swarmLogs: SwarmLog[];
+  swarmHot: boolean;
+  swarmRun: SwarmRun;
+  swarmFix: SwarmFix | null;
+  swarmUndo: SwarmUndo | null;
+  /** Archivist memory: verified findings from past runs. */
+  swarmMemory: SwarmMemory[];
+  terminal: string[];
+  cwd: string;
+  termHistory: string[];
+  storage: StorageItem[];
+  git: GitState;
+  editorMode: EditorMode;
+  /** Last run output per file id (session only). */
+  outputs: Record<string, string>;
+  busy: boolean;
+  savedAt: string;
+  /** Set when localStorage refuses a save (quota). */
+  saveError: string | null;
+  setTab: (tab: Tab) => void;
+  setModule: (module: Module) => void;
+  setTheme: (theme: "night" | "dayglass") => void;
+  setFast: (fast: boolean) => void;
+  setProvider: (provider: string) => void;
+  setDraft: (draft: string) => void;
+  setEditorMode: (mode: EditorMode) => void;
+  setOutput: (fileId: string, output: string) => void;
+  activatePersonality: (id: number) => void;
+  addPersonality: (name: string, instruction: string, suggestions?: string[], skills?: string[]) => void;
+  updatePersonality: (id: number, patch: { name: string; instruction: string; suggestions: string[]; skills?: string[] }) => void;
+  removePersonality: (id: number) => void;
+  openFile: (id: string) => void;
+  toggleFolder: (id: string) => void;
+  flushDraft: () => void;
+  createItem: (parentId: string, type: "file" | "folder", name: string) => void;
+  renameItem: (id: string, name: string) => void;
+  deleteItem: (id: string) => void;
+  loadTemplate: (key: string) => void;
+  pushTerminal: (lines: string[]) => void;
+  clearTerminal: () => void;
+  setCwd: (cwd: string) => void;
+  rememberCommand: (cmd: string) => void;
+  gitInit: () => void;
+  gitAdd: (fileId: string) => void;
+  gitCommit: (message: string) => void;
+  cloneRepo: (name: string) => void;
+  addPack: (pack: Pack) => void;
+  togglePack: (id: string) => void;
+  removePack: (id: string) => void;
+  runSwarm: (goal: string) => Promise<void>;
+  stopSwarm: () => void;
+  fixFinding: (findingId: string) => Promise<void>;
+  applySwarmFix: () => void;
+  discardSwarmFix: () => void;
+  undoSwarmFix: () => void;
+  addStorage: (items: StorageItem[]) => void;
+  removeStorage: (id: string) => void;
+  consult: (prompt: string) => Promise<void>;
+  stopChat: () => void;
+  /** Saves an AI reply as handoff.md, pinned into later prompts. */
+  handOff: (timestamp: number) => void;
+  /** Deletes handoff.md, unpinning it. */
+  clearHandoff: () => void;
+  askTerminal: (prompt: string) => Promise<void>;
+  resetNode: () => void;
+};
+
+const BOOT_TERMINAL = [
+  "CRIMSON OS  v4.2  KORE",
+  "Kernel link steady. Project mounted.",
+  "Type help.",
+];
+
+function fresh(): Pick<
+  OsState,
+  | "tab"
+  | "theme"
+  | "module"
+  | "personalities"
+  | "fast"
+  | "provider"
+  | "files"
+  | "activeFileId"
+  | "workFileId"
+  | "draft"
+  | "chat"
+  | "packs"
+  | "swarmAnxiety"
+  | "swarmLogs"
+  | "swarmMemory"
+  | "terminal"
+  | "cwd"
+  | "termHistory"
+  | "storage"
+  | "git"
+  | "editorMode"
+  | "outputs"
+  | "savedAt"
+> {
+  const brain = SEED_FILES.find((file) => file.id === "brain");
+  return {
+    tab: "toolneuron",
+    theme: "night",
+    module: "chat",
+    personalities: SEED_PERSONALITIES,
+    fast: true,
+    provider: "",
+    files: SEED_FILES,
+    activeFileId: "brain",
+    workFileId: "brain",
+    draft: brain?.content ?? "",
+    chat: [
+      { role: "ai", text: WELCOME, timestamp: Date.now(), intro: true },
+    ],
+    packs: [
+      {
+        id: "doctrine",
+        name: "Review_Doctrine",
+        size: "6 rules",
+        excerpt:
+          "Never interpolate SQL. Never assign untrusted HTML to innerHTML. Do not query inside a loop when a join would do. No bare except. Name things for the next reader. Add type hints on public functions.",
+        status: "indexed",
+        armed: true,
+      },
+    ],
+    swarmAnxiety: 0.02,
+    swarmLogs: [{ id: 1, type: "info", message: "Swarm idle. Open a file and run a review.", time: "boot" }],
+    swarmMemory: [],
+    terminal: BOOT_TERMINAL,
+    cwd: "~/crimson-node",
+    termHistory: [],
+    storage: [
+      { id: "s1", name: "Neural_Architecture_v4.pdf", size: "2.4 MB", type: "pdf", date: "2026-03-20" },
+      { id: "s2", name: "System_Directives.md", size: "12 KB", type: "md", date: "2026-04-02" },
+    ],
+    git: { initialized: false, branch: "main", staged: [], commits: [] },
+    editorMode: "code",
+    outputs: {},
+    savedAt: "",
+  };
+}
+
+function activePersonality(list: Personality[]): Personality {
+  return list.find((item) => item.active) ?? list[0];
+}
+
+const WELCOME = "Neural interface up. Files stay in this browser. Pick a mode in the header, then ask about the open file.";
+/** The welcome line saved before it was mode-neutral (it always claimed Architect). */
+const OLD_WELCOME = "Neural interface up. I am running as the Architect. Files stay in this browser. Ask about the open file, or switch personalities in the header.";
+
+/**
+ * The file the AI should treat as the work in progress: the saved choice if it
+ * still exists, else the open file, else (when the open file is the note) the
+ * first other file.
+ */
+function pickWorkFile(files: ProjectFile[], saved: string | undefined, activeFileId: string): string {
+  const note = findHandoff(files)?.id;
+  const usable = (id: string | undefined) => Boolean(id && id !== note && files.some((file) => file.id === id && file.type === "file"));
+  if (usable(saved)) return saved!;
+  if (usable(activeFileId)) return activeFileId;
+  return files.find((file) => file.type === "file" && file.id !== note)?.id ?? "";
+}
+
+/** The pinned handoff note's text (the live draft when it is the open file). */
+function handoffText(state: OsState): string | undefined {
+  const note = findHandoff(state.files);
+  if (!note) return undefined;
+  return note.id === state.activeFileId ? state.draft : note.content;
+}
+
+/**
+ * System prompt for one chat message: persona, the skills relevant to this
+ * message, the pinned handoff note, armed knowledge, then the open file.
+ * Budget ~7,800 chars (server cap 8,000).
+ */
+function systemPrompt(state: OsState, message: string): { prompt: string; skills: string[] } {
+  const persona = activePersonality(state.personalities);
+  const open = state.files.find((item) => item.id === state.activeFileId);
+  const note = findHandoff(state.files);
+  // While the handoff note is open, the code being worked on is still the last other file.
+  const noteOpen = Boolean(open && open.id === note?.id);
+  const file = noteOpen ? state.files.find((item) => item.id === state.workFileId && item.type === "file" && item.id !== note?.id) : open;
+  const fileText = file ? (file.id === state.activeFileId ? state.draft || file.content || "" : file.content || "") : "";
+  const armed = state.packs.filter((pack) => pack.armed).slice(0, 2);
+  const knowledge = armed.map((pack) => `${pack.name}: ${pack.excerpt.slice(0, 600)}`).join("\n");
+  const skills = pickSkills(persona.skills, message);
+  const handoff = handoffBlock(handoffText(state));
+  const head = [
+    persona.instruction,
+    "You are inside ToolNeuron, a local neural IDE. Be concrete. Short paragraphs. Fence code with a language tag. Do not claim you executed code or rendered an image. You cannot edit files yourself: the file you are working on is included below when one is open, so answer with the changed code (the whole function or file) for the user to apply. Never start a reply with a [Reply from … mode] tag.",
+    skillsBlock(skills).slice(0, 1600),
+    handoff,
+    knowledge ? `Armed knowledge:\n${knowledge}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  const room = Math.max(0, 7800 - head.length - 40);
+  const label = noteOpen ? `Working file ${file?.name} (the user has ${HANDOFF_NAME} open in the editor)` : `Open file ${file?.name}`;
+  const code = file && room > 200 ? `${label}:\n${fileText.slice(0, room)}` : "";
+  return { prompt: [head, code].filter(Boolean).join("\n\n"), skills: skills.map((skill) => skill.name) };
+}
+
+function stamp() {
+  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+let wired = false;
+
+export function bootPersistence() {
+  if (typeof window === "undefined" || wired) return;
+  wired = true;
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(KEY);
+  } catch {
+    /* storage blocked (private mode): run in memory */
+  }
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as Partial<OsState>;
+      const base = fresh();
+      const files = Array.isArray(parsed.files) && parsed.files.length > 0 ? parsed.files : base.files;
+      const activeFileId = files.some((file) => file.id === parsed.activeFileId) ? parsed.activeFileId! : base.activeFileId;
+      const active = files.find((file) => file.id === activeFileId);
+      const savedPersonalities = Array.isArray(parsed.personalities) ? parsed.personalities : [];
+      const known = new Set(savedPersonalities.map((item) => item.name));
+      const personalities =
+        savedPersonalities.length === 0
+          ? base.personalities
+          : [
+              ...withDefaultSkills(savedPersonalities, (parsed as { skillsRev?: number }).skillsRev ?? 0),
+              ...SEED_PERSONALITIES.filter((item) => !known.has(item.name)).map((item) => ({ ...item, active: false })),
+            ];
+      useOs.setState({
+        ...base,
+        ...parsed,
+        files,
+        activeFileId,
+        personalities,
+        draft: typeof parsed.draft === "string" ? parsed.draft : (active?.content ?? ""),
+        workFileId: pickWorkFile(files, parsed.workFileId, activeFileId),
+        // A tab that no longer exists (e.g. the removed Bridge) falls back to the hub.
+        tab: TABS.includes(parsed.tab as Tab) ? (parsed.tab as Tab) : base.tab,
+        // A reply that was streaming when the page closed is finished as-is.
+        chat: (Array.isArray(parsed.chat) ? parsed.chat : base.chat)
+          .filter((message) => !(message.pending && !message.text))
+          .map((message) => (message.pending ? { ...message, pending: false, stopped: true } : message))
+          // Older saves hold the welcome line that claimed Architect mode.
+          .map((message) => (message.role === "ai" && (message.intro || message.text === OLD_WELCOME) ? { ...message, text: WELCOME, intro: true } : message)),
+        busy: false,
+        swarmHot: false,
+        booted: true,
+      });
+    } catch {
+      // Corrupt save: keep a copy for recovery, then start clean.
+      try {
+        localStorage.setItem(`${KEY}_corrupt`, raw);
+        localStorage.removeItem(KEY);
+      } catch {
+        /* ignore */
+      }
+      useOs.setState({ booted: true });
+    }
+  } else {
+    useOs.setState({ booted: true });
+  }
+  useOs.subscribe((state) => {
+    if (state.booted) scheduleSave();
+  });
+  // Never lose the last edits when the tab closes or goes to the background.
+  window.addEventListener("pagehide", flushSave);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushSave();
+  });
+}
+
+// ---- Debounced persistence ----
+const SAVE_DELAY_MS = 600;
+const SAVE_MAX_WAIT_MS = 3000;
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let firstPendingAt = 0;
+let lastSaved = "";
+
+function scheduleSave() {
+  const now = Date.now();
+  if (!saveTimer) firstPendingAt = now;
+  if (saveTimer) clearTimeout(saveTimer);
+  // Debounce while typing, but never hold changes longer than SAVE_MAX_WAIT_MS.
+  const wait = Math.max(0, Math.min(SAVE_DELAY_MS, firstPendingAt + SAVE_MAX_WAIT_MS - now));
+  saveTimer = setTimeout(flushSave, wait);
+}
+
+export function flushSave() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = null;
+  const state = useOs.getState();
+  if (!state.booted) return;
+  const json = JSON.stringify(persistable(state, false));
+  if (json === lastSaved) return;
+  try {
+    localStorage.setItem(KEY, json);
+    lastSaved = json;
+    if (state.saveError) useOs.setState({ saveError: null });
+  } catch {
+    // Quota hit: retry without bulky history before giving up.
+    try {
+      const slim = JSON.stringify(persistable(state, true));
+      localStorage.setItem(KEY, slim);
+      lastSaved = json;
+      setSaveError("Browser storage is nearly full: older chat and terminal history was not saved.");
+    } catch {
+      setSaveError("Browser storage is full: recent changes are NOT saved. Export your node from Config.");
+    }
+  }
+}
+
+const TABS: Tab[] = ["toolneuron", "terminal", "editor", "analysis", "storage", "settings"];
+
+/** Whole-node backup as a JSON string (Config → Export). The vault is included still encrypted. */
+export function exportNode(): string {
+  const vault = exportVaultBlob();
+  return wrapExport({ ...persistable(useOs.getState(), false), ...(vault ? { vaultBlob: vault } : {}) });
+}
+
+/** Replaces the node with a validated backup. Returns a summary or an error. */
+export function importNode(text: string): { ok: true; summary: string } | { ok: false; error: string } {
+  const parsed = parseImport(text);
+  if (!parsed.ok) return parsed;
+  const data = parsed.node;
+  chatAbort?.abort();
+  chatAbort = null;
+  stopSwarm();
+  const base = fresh();
+  const files = data.files;
+  const firstFile = files.find((item) => item.type === "file");
+  const activeFileId = files.some((item) => item.id === data.activeFileId && item.type === "file")
+    ? data.activeFileId!
+    : (firstFile?.id ?? "");
+  const active = files.find((item) => item.id === activeFileId);
+  const pick = <T,>(value: unknown, fallback: T): T =>
+    Array.isArray(fallback) ? (Array.isArray(value) ? (value as T) : fallback) : value !== undefined && typeof value === typeof fallback ? (value as T) : fallback;
+  useOs.setState({
+    ...base,
+    files,
+    activeFileId,
+    draft: typeof data.draft === "string" && data.activeFileId === activeFileId ? data.draft : (active?.content ?? ""),
+    workFileId: pickWorkFile(files, undefined, activeFileId),
+    personalities: data.personalities && data.personalities.length > 0 ? withDefaultSkills(data.personalities, 0) : base.personalities,
+    chat: data.chat ?? base.chat,
+    packs: pick(data.packs, base.packs),
+    git: pick(data.git, base.git),
+    storage: pick(data.storage, base.storage),
+    swarmMemory: pick(data.swarmMemory, base.swarmMemory),
+    theme: data.theme === "dayglass" ? "dayglass" : base.theme,
+    fast: pick(data.fast, base.fast),
+    provider: pick(data.provider, base.provider),
+    tab: "settings",
+    outputs: {},
+    busy: false,
+    swarmHot: false,
+    swarmRun: idleRun(),
+    swarmFix: null,
+    swarmUndo: null,
+    booted: true,
+  });
+  flushSave();
+  // The backup's vault (still encrypted) replaces this browser's vault only if it has one.
+  const vaultRestored = data.vaultBlob !== undefined && importVaultBlob(data.vaultBlob);
+  const fileCount = files.filter((item) => item.type === "file").length;
+  return { ok: true, summary: `Imported ${fileCount} file${fileCount === 1 ? "" : "s"}${data.chat && data.chat.length ? ` and ${data.chat.length} chat message${data.chat.length === 1 ? "" : "s"}` : ""}.${vaultRestored ? " The encrypted vault was restored; unlock it with its passphrase." : ""}` };
+}
+
+function setSaveError(message: string) {
+  if (useOs.getState().saveError !== message) useOs.setState({ saveError: message });
+}
+
+/**
+ * Bumped when built-in modes gain default skills. Rev 1 covered 9 modes;
+ * rev 2 added Nightwatch, Lattice and Oracle.
+ */
+const SKILLS_REV = 2;
+
+/**
+ * Fills in default skills for built-in modes. A save with no skills list
+ * (from before skills existed) always gets defaults; an empty list on a
+ * built-in mode is refilled only once, when the save predates SKILLS_REV,
+ * so a mode the user cleared on purpose stays empty. Custom personas
+ * (no defaults) are left as they are.
+ */
+function withDefaultSkills(list: Personality[], savedRev: number): Personality[] {
+  return list.map((item) => {
+    const defaults = DEFAULT_SKILLS[item.name];
+    if (!Array.isArray(item.skills)) return { ...item, skills: defaults ?? [] };
+    if (defaults && item.skills.length === 0 && savedRev < SKILLS_REV) return { ...item, skills: defaults };
+    return item;
+  });
+}
+
+function persistable(state: OsState, slim: boolean) {
+  return {
+      skillsRev: SKILLS_REV,
+      tab: state.tab,
+      theme: state.theme,
+      module: state.module,
+      personalities: state.personalities,
+      fast: state.fast,
+      provider: state.provider,
+      files: state.files,
+      activeFileId: state.activeFileId,
+      workFileId: state.workFileId,
+      draft: state.draft,
+      chat: state.chat.slice(slim ? -6 : -40),
+      packs: state.packs,
+      swarmAnxiety: state.swarmAnxiety,
+      swarmLogs: state.swarmLogs.slice(0, slim ? 5 : 30),
+      swarmMemory: state.swarmMemory.slice(0, slim ? 10 : 40),
+      terminal: state.terminal.slice(slim ? -10 : -80),
+      cwd: state.cwd,
+      termHistory: state.termHistory.slice(0, 30),
+      storage: state.storage,
+      git: state.git,
+      editorMode: state.editorMode,
+  };
+}
+
+/** The in-flight chat request, so Stop (and reset) can cancel it. */
+let chatAbort: AbortController | null = null;
+
+export const useOs = create<OsState>((set, get) => ({
+  booted: false,
+  swarmHot: false,
+  swarmRun: idleRun(),
+  swarmFix: null,
+  swarmUndo: null,
+  busy: false,
+  saveError: null,
+  ...fresh(),
+
+  setTab: (tab) => set({ tab }),
+  setModule: (module) => set({ module }),
+  setTheme: (theme) => set({ theme }),
+  setFast: (fast) => set({ fast }),
+  setProvider: (provider) => set({ provider }),
+  setDraft: (draft) => set({ draft }),
+  setEditorMode: (mode) => set({ editorMode: mode }),
+  setOutput: (fileId, output) => set({ outputs: { ...get().outputs, [fileId]: output } }),
+
+  activatePersonality: (id) =>
+    set({
+      personalities: get().personalities.map((item) => ({ ...item, active: item.id === id })),
+    }),
+
+  addPersonality: (name: string, instruction: string, suggestions?: string[], skills?: string[]) => {
+    const id = Date.now();
+    const chips = (suggestions ?? []).map((item) => item.trim()).filter(Boolean).slice(0, 4);
+    set({
+      personalities: [
+        ...get().personalities.map((item) => ({ ...item, active: false })),
+        {
+          id,
+          name,
+          instruction,
+          active: true,
+          suggestions: chips.length > 0 ? chips : ["Review the open file", "What next?"],
+          skills: skills ?? [],
+        },
+      ],
+    });
+  },
+
+  updatePersonality: (id, patch) => {
+    const chips = patch.suggestions.map((item) => item.trim()).filter(Boolean).slice(0, 4);
+    set({
+      personalities: get().personalities.map((item) =>
+        item.id === id
+          ? {
+              ...item,
+              name: patch.name.trim() || item.name,
+              instruction: patch.instruction.trim() || item.instruction,
+              suggestions: chips.length > 0 ? chips : item.suggestions,
+              skills: patch.skills ?? item.skills,
+            }
+          : item,
+      ),
+    });
+  },
+
+  removePersonality: (id) => {
+    const next = get().personalities.filter((item) => item.id !== id);
+    if (next.length === 0) return;
+    if (!next.some((item) => item.active)) next[0] = { ...next[0], active: true };
+    set({ personalities: next });
+  },
+
+  flushDraft: () => {
+    const { files, activeFileId, draft } = get();
+    set({
+      files: files.map((file) => (file.id === activeFileId && file.type === "file" ? { ...file, content: draft } : file)),
+      savedAt: stamp(),
+    });
+  },
+
+  openFile: (id) => {
+    const state = get();
+    const files = state.files.map((file) =>
+      file.id === state.activeFileId && file.type === "file" ? { ...file, content: state.draft } : file,
+    );
+    const next = files.find((file) => file.id === id);
+    if (!next || next.type !== "file") {
+      set({ files });
+      return;
+    }
+    set({
+      files,
+      activeFileId: id,
+      ...(next.id === findHandoff(files)?.id ? {} : { workFileId: id }),
+      draft: next.content ?? "",
+      editorMode: next.language === "html" ? state.editorMode : "code",
+      savedAt: stamp(),
+    });
+  },
+
+  toggleFolder: (id) =>
+    set({
+      files: get().files.map((file) => (file.id === id ? { ...file, isOpen: !file.isOpen } : file)),
+    }),
+
+  createItem: (parentId, type, name) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const id = `f_${Date.now()}`;
+    const item: ProjectFile = {
+      id,
+      name: trimmed,
+      type,
+      parentId,
+      isOpen: type === "folder",
+      language: type === "file" ? languageFromName(trimmed) : undefined,
+      content: type === "file" ? "" : undefined,
+    };
+    const files = get().files.map((file) => (file.id === parentId ? { ...file, isOpen: true } : file)).concat(item);
+    if (type === "file") {
+      get().flushDraft();
+      set({ files: get().files.concat(item).map((file) => (file.id === parentId ? { ...file, isOpen: true } : file)), activeFileId: id, draft: "" });
+      return;
+    }
+    set({ files });
+  },
+
+  renameItem: (id, name) => {
+    const trimmed = name.trim();
+    if (!trimmed || id === "root") return;
+    set({
+      files: get().files.map((file) =>
+        file.id === id
+          ? { ...file, name: trimmed, language: file.type === "file" ? languageFromName(trimmed) : file.language }
+          : file,
+      ),
+    });
+  },
+
+  deleteItem: (id) => {
+    if (id === "root") return;
+    const drop = new Set<string>([id]);
+    let grew = true;
+    const files = get().files;
+    while (grew) {
+      grew = false;
+      for (const file of files) {
+        if (file.parentId && drop.has(file.parentId) && !drop.has(file.id)) {
+          drop.add(file.id);
+          grew = true;
+        }
+      }
+    }
+    const next = files.filter((file) => !drop.has(file.id));
+    const state = get();
+    const git = { ...state.git, staged: state.git.staged.filter((staged) => !drop.has(staged)) };
+    const outputs = Object.fromEntries(Object.entries(state.outputs).filter(([fileId]) => !drop.has(fileId)));
+    if (!drop.has(state.activeFileId)) {
+      set({ files: next, git, outputs });
+      return;
+    }
+    const fallback = next.find((file) => file.type === "file");
+    set({
+      files: next,
+      git,
+      outputs,
+      activeFileId: fallback?.id ?? "",
+      draft: fallback?.content ?? "",
+    });
+  },
+
+  loadTemplate: (key) => {
+    const template = TEMPLATES[key];
+    if (!template) return;
+    const first = template.files.find((file) => file.type === "file");
+    set({
+      files: template.files,
+      activeFileId: first?.id ?? "",
+      draft: first?.content ?? "",
+      git: { initialized: false, branch: "main", staged: [], commits: [] },
+      editorMode: first?.language === "html" ? "preview" : "code",
+      savedAt: stamp(),
+    });
+  },
+
+  pushTerminal: (lines) => set({ terminal: [...get().terminal, ...lines].slice(-200) }),
+  clearTerminal: () => set({ terminal: ["Buffer flushed."] }),
+  setCwd: (cwd) => set({ cwd }),
+  rememberCommand: (cmd) => set({ termHistory: [cmd, ...get().termHistory].slice(0, 40) }),
+
+  gitInit: () => set({ git: { ...get().git, initialized: true, branch: "main" } }),
+  gitAdd: (fileId) => {
+    const file = get().files.find((item) => item.id === fileId && item.type === "file");
+    if (!file) {
+      get().pushTerminal(["[ERROR] That file is no longer in the project"]);
+      return;
+    }
+    const staged = get().git.staged.includes(file.id) ? get().git.staged : [...get().git.staged, file.id];
+    set({ git: { ...get().git, staged } });
+  },
+  gitCommit: (message) => {
+    const git = get().git;
+    if (git.staged.length === 0) {
+      get().pushTerminal(["[WARN] Nothing staged."]);
+      return;
+    }
+    set({
+      git: {
+        ...git,
+        staged: [],
+        commits: [{ id: Math.random().toString(16).slice(2, 9), message, time: stamp() }, ...git.commits].slice(0, 20),
+      },
+    });
+  },
+
+  cloneRepo: (name) => {
+    const repoName = name.split("/").pop()?.replace(/\.git$/, "") || "repo";
+    const root = `repo_${Date.now()}`;
+    const additions: ProjectFile[] = [
+      { id: root, name: repoName, type: "folder", parentId: "root", isOpen: true },
+      {
+        id: `${root}_readme`,
+        name: "README.md",
+        type: "file",
+        parentId: root,
+        language: "markdown",
+        content: `# ${repoName}\n\nStub cloned on the Crimson node. Wire the real remote when you have one.\n`,
+      },
+      {
+        id: `${root}_main`,
+        name: "main.py",
+        type: "file",
+        parentId: root,
+        language: "python",
+        content: `def main() -> None:\n    print("${repoName} online")\n\nmain()\n`,
+      },
+    ];
+    const parent = get().files.some((file) => file.id === "root") ? "root" : get().files.find((file) => file.parentId === null)?.id;
+    const fixed = additions.map((file) => (file.id === root ? { ...file, parentId: parent ?? null } : file));
+    set({ files: [...get().files.map((file) => (file.id === parent ? { ...file, isOpen: true } : file)), ...fixed] });
+  },
+
+
+  addPack: (pack) => set({ packs: [pack, ...get().packs] }),
+  togglePack: (id) => set({ packs: get().packs.map((pack) => (pack.id === id ? { ...pack, armed: !pack.armed } : pack)) }),
+  removePack: (id) => set({ packs: get().packs.filter((pack) => pack.id !== id || pack.id === "doctrine") }),
+
+  runSwarm: (goal) => runReview({ get, set }, goal),
+  stopSwarm: () => stopSwarm(),
+  fixFinding: (findingId) => runFix({ get, set }, findingId),
+  applySwarmFix: () => applyFix({ get, set }),
+  discardSwarmFix: () => {
+    if (!get().swarmHot) set({ swarmFix: null });
+  },
+  undoSwarmFix: () => undoFix({ get, set }),
+
+  addStorage: (items) => set({ storage: [...items, ...get().storage] }),
+  removeStorage: (id) => set({ storage: get().storage.filter((item) => item.id !== id) }),
+
+  consult: async (prompt) => {
+    const text = prompt.trim();
+    if (!text || get().busy) return;
+    const user: ChatMessage = { role: "user", text, timestamp: Date.now() };
+    const history = [...get().chat, user];
+    set({ chat: history, busy: true, tab: "toolneuron", module: "chat" });
+    try {
+      const fileMatch = text.match(/(?:create|generate) (?:a )?(?:new )?file named ([A-Za-z0-9_.-]+)/i);
+      // Drop error notices, and the user turns that only produced an error,
+      // so the model never answers a request the app already refused.
+      const kept = history
+        .filter((message, index) => !message.error && !message.intro && !(message.role === "user" && history[index + 1]?.error))
+        .slice(-8);
+      const messages = labelHistory(kept, activePersonality(get().personalities).name);
+      if (fileMatch) {
+        messages[messages.length - 1] = {
+          role: "user",
+          content: `Write only the raw file contents for ${fileMatch[1]}. Request: ${text}`,
+        };
+      }
+      const startedAt = Date.now();
+      const controller = new AbortController();
+      chatAbort = controller;
+      const system = systemPrompt(get(), text);
+      set({ chat: [...get().chat, { role: "ai", text: "", timestamp: startedAt, pending: true, skills: system.skills, mode: activePersonality(get().personalities).name }] });
+      // Replace the streaming placeholder (always the message stamped startedAt).
+      const patchReply = (patch: Partial<ChatMessage> | null, extra: ChatMessage[] = []) => {
+        const chat = get().chat.flatMap((message) =>
+          message.timestamp === startedAt && message.role === "ai"
+            ? patch
+              ? [{ ...message, ...patch, ...(typeof patch.text === "string" ? { text: stripModeLabel(patch.text) } : {}) }]
+              : []
+            : [message],
+        );
+        set({ chat: [...chat, ...extra] });
+      };
+      const result = await streamChat(
+        { messages, system: system.prompt, fast: get().fast && !fileMatch, provider: get().provider },
+        { signal: controller.signal, onDelta: (textSoFar) => patchReply({ text: textSoFar }) },
+      );
+      if (chatAbort === controller) chatAbort = null;
+
+      if (fileMatch && result.ok) {
+        const name = fileMatch[1];
+        const id = `gen_${Date.now()}`;
+        const parent = get().files.find((file) => file.parentId === null)?.id ?? "root";
+        const fenced = result.text.match(/```[^\n]*\n([\s\S]*?)```/);
+        const content = (fenced ? fenced[1] : result.text).trim();
+        const item: ProjectFile = {
+          id,
+          name,
+          type: "file",
+          parentId: parent,
+          language: languageFromName(name),
+          content,
+        };
+        patchReply({ text: `Wrote ${name} into the project and opened it in the editor.`, pending: false });
+        set({ files: [...get().files, item], activeFileId: id, draft: content, busy: false });
+        return;
+      }
+      if (result.ok) {
+        patchReply({ text: result.text, pending: false, ...(result.cut ? { cut: true } : {}) });
+      } else if (result.text.trim()) {
+        // Keep what arrived; flag the cut or add the error as a separate notice.
+        patchReply(
+          { text: result.text, pending: false, stopped: result.stopped === true },
+          result.stopped ? [] : [{ role: "ai", text: result.error, timestamp: Date.now(), error: true }],
+        );
+      } else {
+        patchReply({ text: result.error, pending: false, error: true });
+      }
+      set({ busy: false });
+    } catch {
+      chatAbort = null;
+      set({
+        chat: [
+          ...get().chat.filter((message) => !message.pending),
+          { role: "ai", text: "The link dropped before a reply landed.", timestamp: Date.now(), error: true },
+        ],
+        busy: false,
+      });
+    }
+  },
+
+  stopChat: () => {
+    chatAbort?.abort();
+  },
+
+  handOff: (timestamp) => {
+    const state = get();
+    const reply = state.chat.find((message) => message.timestamp === timestamp && message.role === "ai" && !message.error && !message.pending && !message.intro);
+    if (!reply || !reply.text.trim()) return;
+    // Replies from before mode labels (and the welcome message) have no mode.
+    const content = formatHandoff(reply.mode ?? "", reply.cut ? `${reply.text}\n\n[This reply was cut off at the length limit.]` : reply.text, new Date());
+    const existing = findHandoff(state.files);
+    if (existing) {
+      set({
+        files: state.files.map((file) => (file.id === existing.id ? { ...file, content } : file)),
+        // Keep the editor in step when the note is open.
+        ...(state.activeFileId === existing.id ? { draft: content } : {}),
+      });
+      return;
+    }
+    const parent = state.files.find((file) => file.parentId === null)?.id ?? "root";
+    const item: ProjectFile = { id: `handoff_${Date.now()}`, name: HANDOFF_NAME, type: "file", parentId: parent, language: "markdown", content };
+    set({ files: [...state.files, item] });
+  },
+
+  clearHandoff: () => {
+    const note = findHandoff(get().files);
+    if (note) get().deleteItem(note.id);
+  },
+
+  askTerminal: async (prompt) => {
+    if (get().busy) {
+      get().pushTerminal(["[WARN] Link is already busy."]);
+      return;
+    }
+    set({ busy: true });
+    const persona = activePersonality(get().personalities);
+    try {
+      const skills = pickSkills(persona.skills, prompt, 1);
+      if (skills.length) get().pushTerminal([`[SKILL] ${skills.map((skill) => skill.name).join(", ")}`]);
+      const result = await askCrimson({
+        data: {
+          messages: [{ role: "user", content: prompt }],
+          system: `${persona.instruction}\n${skillsBlock(skills)}\n${handoffBlock(handoffText(get()), 1200)}\nReply as a terminal specialist in under 80 words. Current directory ${get().cwd}.`,
+          fast: true,
+          provider: get().provider,
+        },
+      });
+      get().pushTerminal([result.ok ? `CORE (${persona.name.toUpperCase()}): ${result.text}` : `[ERROR] ${result.error}`]);
+    } catch {
+      get().pushTerminal(["[ERROR] The AI link dropped."]);
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  resetNode: () => {
+    chatAbort?.abort();
+    chatAbort = null;
+    stopSwarm();
+    lastSaved = "";
+    try {
+      localStorage.removeItem(KEY);
+    } catch {
+      /* ignore */
+    }
+    set({ ...fresh(), busy: false, swarmHot: false, swarmRun: idleRun(), swarmFix: null, swarmUndo: null, booted: true });
+  },
+}));
+
+if (typeof window !== "undefined") {
+  const current = useOs.getState().personalities;
+  const known = new Set(current.map((item) => item.name));
+  const extras = SEED_PERSONALITIES.filter((item) => !known.has(item.name)).map((item) => ({ ...item, active: false }));
+  if (extras.length > 0) useOs.setState({ personalities: [...current, ...extras] });
+}

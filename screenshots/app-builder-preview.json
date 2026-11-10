@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Crimson OS",
+      "hasCanvas": false,
+      "bodyTextLen": 386,
+      "bodyTextHash": "4f48cdd9139a3992a4cb6688476140c69d181d84187f4574563bb60bda60a0cb",
+      "bodyTextPrefix": "TOOLNEURON Persona Architect Syntax-Prime Vanguard Aegis HackMen",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Crimson OS",
+      "hasCanvas": false,
+      "bodyTextLen": 364,
+      "bodyTextHash": "17b179b5d42cc1639f110deb1d9b4cb7e759353b1a73fb4e8b083db41fda9b83",
+      "bodyTextPrefix": "TOOLNEURON Grok flash ToolNeuron NEURAL IDE CHAT VISION DATABASE",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-preview.json"
+}
