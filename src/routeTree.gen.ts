@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiChatRouteImport } from './routes/api/chat'
 import { Route as ApiCloneRouteImport } from './routes/api/clone'
+import { Route as ApiGitPushRouteImport } from './routes/api/git/push'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -28,35 +29,44 @@ const ApiCloneRoute = ApiCloneRouteImport.update({
   path: '/api/clone',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiGitPushRoute = ApiGitPushRouteImport.update({
+  id: '/api/git/push',
+  path: '/api/git/push',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/api/chat': typeof ApiChatRoute
   '/api/clone': typeof ApiCloneRoute
+  '/api/git/push': typeof ApiGitPushRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/api/chat': typeof ApiChatRoute
   '/api/clone': typeof ApiCloneRoute
+  '/api/git/push': typeof ApiGitPushRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/api/chat': typeof ApiChatRoute
   '/api/clone': typeof ApiCloneRoute
+  '/api/git/push': typeof ApiGitPushRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/api/chat' | '/api/clone'
+  fullPaths: '/' | '/api/chat' | '/api/clone' | '/api/git/push'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/api/chat' | '/api/clone'
-  id: '__root__' | '/' | '/api/chat' | '/api/clone'
+  to: '/' | '/api/chat' | '/api/clone' | '/api/git/push'
+  id: '__root__' | '/' | '/api/chat' | '/api/clone' | '/api/git/push'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiChatRoute: typeof ApiChatRoute
   ApiCloneRoute: typeof ApiCloneRoute
+  ApiGitPushRoute: typeof ApiGitPushRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -82,6 +92,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiCloneRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/git/push': {
+      id: '/api/git/push'
+      path: '/api/git/push'
+      fullPath: '/api/git/push'
+      preLoaderRoute: typeof ApiGitPushRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -89,6 +106,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiChatRoute: ApiChatRoute,
   ApiCloneRoute: ApiCloneRoute,
+  ApiGitPushRoute: ApiGitPushRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

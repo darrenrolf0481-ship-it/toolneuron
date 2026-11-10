@@ -11,6 +11,10 @@ export function GitPanel() {
   const gitInit = useOs((state) => state.gitInit);
   const gitAdd = useOs((state) => state.gitAdd);
   const gitCommit = useOs((state) => state.gitCommit);
+  const applyGit = useOs((state) => state.applyGit);
+  const gitPush = useOs((state) => state.gitPush);
+  const [branchName, setBranchName] = useState("");
+  const [pushing, setPushing] = useState(false);
   const [message, setMessage] = useState("");
   const [open, setOpen] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
@@ -54,12 +58,75 @@ export function GitPanel() {
     </li>
   );
 
+  const branches = Object.keys(git.branches ?? { [git.branch]: undefined }).sort();
+  const plan = Git.pushPlan(git);
+  const toPush = typeof plan === "string" ? 0 : plan.commits.length;
+
   return (
     <div className="os-scroll flex-1 space-y-4 overflow-y-auto p-4">
+      <section aria-label="Branches" className="flex flex-wrap items-center gap-2 text-sm">
+        <label className="text-muted" htmlFor="git-branch">
+          Branch
+        </label>
+        <select
+          id="git-branch"
+          value={git.branch}
+          onChange={(event) => {
+            const result = Git.switchBranch(git, work, event.target.value);
+            if (typeof result === "string") setNotice(result);
+            else {
+              applyGit(result.git, result.changes);
+              setNotice(`Switched to ${event.target.value}${result.changes.length ? `: ${result.changes.length} file(s) updated` : ""}.`);
+            }
+          }}
+          className="min-h-11 rounded-2xl border border-border bg-bg px-3 text-sm"
+        >
+          {branches.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </select>
+        <form
+          className="flex min-w-0 flex-1 gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const name = branchName.trim();
+            if (!name) return;
+            const made = Git.createBranch(git, name);
+            if (typeof made === "string") setNotice(made);
+            else {
+              applyGit({ ...made, branch: name });
+              setBranchName("");
+              setNotice(`Created and switched to ${name}.`);
+            }
+          }}
+        >
+          <input value={branchName} onChange={(event) => setBranchName(event.target.value)} placeholder="new branch" aria-label="New branch name" className="min-h-11 min-w-0 flex-1 rounded-2xl border border-border bg-bg px-3 text-sm outline-none" />
+          <button type="submit" disabled={!branchName.trim()} className="min-h-11 rounded-2xl border border-border px-3 text-sm disabled:opacity-40">
+            Create
+          </button>
+        </form>
+      </section>
       <p className="text-sm text-muted">
-        On {git.branch}
-        {head ? `, last commit ${head.id}` : ", no commits yet"}. History stays in this browser; there is no remote.
+        {head ? `Last commit ${head.id}` : "No commits yet"}. History stays in this browser.{" "}
+        {git.remote ? `Pushes project/${git.remote.dir ? `${git.remote.dir}/` : ""} to ${git.remote.repo}.` : "No remote: clone a repo with GITHUB_TOKEN set, or git remote add origin owner/name in the terminal."}
       </p>
+      {git.remote && (
+        <button
+          type="button"
+          disabled={pushing || toPush === 0}
+          onClick={async () => {
+            setPushing(true);
+            const result = await gitPush();
+            setPushing(false);
+            setNotice(result.message);
+          }}
+          className="min-h-11 rounded-2xl bg-primary px-4 text-sm font-semibold text-on-primary disabled:opacity-40"
+        >
+          {pushing ? "Pushing…" : toPush ? `Push ${toPush} commit(s) to ${git.remote.repo}` : "Nothing to push"}
+        </button>
+      )}
 
       <section aria-label="Changes not staged" className="space-y-2">
         <div className="flex items-center justify-between gap-2">
@@ -97,27 +164,33 @@ export function GitPanel() {
             Commit
           </button>
         </form>
-        {notice && <p className="text-xs text-muted" role="status">{notice}</p>}
       </section>
+      {notice && (
+        <p className="text-xs text-muted" role="status">
+          {notice}
+        </p>
+      )}
 
       <section aria-label="History" className="space-y-2">
-        <h3 className="text-xs font-semibold tracking-widest text-primary uppercase">History ({git.commits.length})</h3>
+        <h3 className="text-xs font-semibold tracking-widest text-primary uppercase">History of {git.branch} ({Git.history(git).length})</h3>
         <ul className="space-y-2">
-          {git.commits.map((commit, i) => {
-            const parent = git.commits[i + 1]?.tree ?? {};
-            const changed = commit.tree ? Git.compareTrees(commit.parent ? parent : {}, commit.tree).length : null;
+          {Git.history(git).map((commit) => {
+            const parent = git.commits.find((item) => item.id === commit.parent)?.tree ?? {};
+            const changed = commit.tree ? Git.compareTrees(parent, commit.tree).length : null;
+            const onGitHub = git.remote?.shas[commit.id];
             return (
               <li key={commit.id} className="rounded-2xl border border-border bg-surface px-3 py-2 text-sm">
                 <span className="font-mono text-xs text-primary">{commit.id}</span> {commit.message}
                 <span className="block text-xs text-muted">
                   {commit.time}
                   {changed === null ? " · no snapshot (made before history was real)" : ` · ${changed} file(s)`}
+                  {onGitHub ? ` · on GitHub ${onGitHub.slice(0, 7)}` : ""}
                 </span>
               </li>
             );
           })}
         </ul>
-        <p className="text-xs text-muted">Restore from the terminal: git restore &lt;path&gt; or git checkout &lt;commit&gt; -- &lt;path&gt;.</p>
+        <p className="text-xs text-muted">In the terminal: git restore &lt;path&gt;, git checkout &lt;commit&gt; -- &lt;path&gt;, git merge &lt;branch&gt; (fast-forward only), git branch -d &lt;branch&gt;.</p>
       </section>
     </div>
   );

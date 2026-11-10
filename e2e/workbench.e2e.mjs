@@ -18,7 +18,7 @@ after(async () => {
   await browser?.close();
 });
 
-async function openApp({ clone } = {}) {
+async function openApp({ clone, push } = {}) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 844 } });
   const page = await context.newPage();
   const errors = [];
@@ -30,6 +30,12 @@ async function openApp({ clone } = {}) {
   });
   await page.route("**/api/clone", async (route) => {
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(clone ?? { ok: false, error: "no fake set" }) });
+  });
+  const pushes = [];
+  await page.route("**/api/git/push", async (route) => {
+    pushes.push(route.request().postDataJSON());
+    const reply = typeof push === "function" ? push(pushes.at(-1)) : (push ?? { ok: false, error: "no fake set" });
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(reply) });
   });
   await page.addInitScript(() => {
     if (sessionStorage.getItem("e2e-seeded")) return;
@@ -49,7 +55,7 @@ async function openApp({ clone } = {}) {
     await page.waitForTimeout(3500);
     return page.evaluate(() => JSON.parse(localStorage.getItem("crimson_os_v1") || "{}"));
   };
-  return { page, sent, errors, term, saved, close: () => context.close() };
+  return { page, sent, pushes, errors, term, saved, close: () => context.close() };
 }
 
 describe("terminal git", () => {
@@ -77,6 +83,8 @@ describe("terminal git", () => {
     out = await app.term("git status");
     assert.match(out.split("git status").at(-1), /working tree clean/);
     out = await app.term("git push");
+    assert.match(out, /no remote/);
+    out = await app.term("git pull");
     assert.match(out, /not available/);
     const state = await app.saved();
     assert.equal(state.git.commits[0].message, "start");
@@ -119,7 +127,7 @@ describe("clone", () => {
     const text = await app.page.locator(".os-scroll").first().innerText();
     assert.match(out + text, /Copied 2 text file\(s\) from github\.com\/octo\/demo into project\/demo\//);
     assert.match(text, /left out: 2 binary, 1 ignored folder/);
-    assert.match(text, /not a linked clone/);
+    assert.match(text, /plain copy with no link back/);
     assert.match(await app.term("cat project/demo/src/app.py"), /print\('hi'\)/);
     assert.match(await app.term("gh repo clone demo"), /needs a public GitHub repo/);
     await app.close();
@@ -153,6 +161,91 @@ describe("knowledge packs", () => {
     const system = app.sent.at(-1).system;
     assert.match(system, /Knowledge \(sections of the user's packs that match this message\):/);
     assert.match(system, /\[manual\.md §\d+\]\nRefunds\. Refunds are paid within 14 days/);
+    await app.close();
+  });
+});
+
+describe("branches and push", () => {
+  const sha = (c) => c.repeat(40);
+  it("a linked clone pushes only new commits, as changes inside the repo, then is up to date", async () => {
+    let n = 0;
+    const app = await openApp({
+      clone: { ok: true, repo: "me/site", linked: true, sha: sha("a"), branch: "main", private: true, files: [{ path: "index.html", content: "<h1>v1</h1>\n" }], skipped: { binary: 1, tooLarge: 0, ignoredFolder: 0, overLimit: 0 } },
+      push: (plan) => ({ ok: true, shas: plan.commits.map(() => sha(String(++n))), url: "https://github.com/me/site/tree/main", created: false }),
+    });
+    await app.page.getByRole("button", { name: "Term" }).first().click();
+    await app.term("gh repo clone me/site");
+    await app.page.waitForTimeout(400);
+    let out = await app.term("git remote");
+    assert.match(out, /Linked: project\/site\/ pushes to me\/site \(main → main\)/);
+    assert.match(out, /origin +https:\/\/github\.com\/me\/site +\(folder: project\/site\)/);
+    assert.match(await app.term("git push"), /Everything up-to-date/);
+    // Edit the cloned file (and a file outside the repo folder) and commit both.
+    await app.term("cat project/site/index.html");
+    await app.page.getByRole("button", { name: "Edit" }).first().click();
+    await app.page.getByText("index.html", { exact: true }).click();
+    await app.page.locator(".cm-content").click();
+    await app.page.keyboard.press("Control+End");
+    await app.page.keyboard.type("<p>edited</p>");
+    await app.page.getByRole("button", { name: "Term" }).first().click();
+    await app.term("git add .");
+    await app.term('git commit -m "edit the page"');
+    out = await app.term("git push");
+    await app.page.waitForTimeout(400);
+    assert.equal(app.pushes.length, 1);
+    const plan = app.pushes[0];
+    assert.equal(plan.repo, "me/site");
+    assert.equal(plan.branch, "main");
+    assert.equal(plan.parentSha, sha("a"));
+    assert.equal(plan.commits.length, 1);
+    assert.deepEqual(plan.commits[0].changes.map((c) => c.path), ["index.html"], "only paths inside the repo folder, relative to it");
+    assert.match(plan.commits[0].changes[0].content, /<p>edited<\/p>/);
+    const text = await app.page.locator(".os-scroll").first().innerText();
+    assert.match(text, /Updated me\/site main: 1 commit\(s\), now at 1111111/);
+    assert.match(await app.term("git push"), /Everything up-to-date/);
+    await app.close();
+  });
+
+  it("shows a refused push and keeps the commits unpushed", async () => {
+    const app = await openApp({
+      clone: { ok: true, repo: "me/site", linked: true, sha: sha("a"), branch: "main", files: [{ path: "a.txt", content: "1" }], skipped: {} },
+      push: { ok: false, error: "Rejected: me/site 'main' has commits this project does not have (not a fast-forward)." },
+    });
+    await app.page.getByRole("button", { name: "Term" }).first().click();
+    await app.term("gh repo clone me/site");
+    await app.page.waitForTimeout(400);
+    await app.page.getByRole("button", { name: "Edit" }).first().click();
+    await app.page.getByRole("button", { name: "git", exact: true }).click();
+    // Make a change through the terminal-free path: new branch, commit from the panel.
+    await app.page.getByLabel("New branch name").fill("fix");
+    await app.page.getByRole("button", { name: "Create" }).click();
+    assert.equal(await app.page.locator("#git-branch").inputValue(), "fix");
+    await app.page.getByRole("button", { name: "code", exact: true }).click();
+    await app.page.getByText("a.txt", { exact: true }).click();
+    await app.page.locator(".cm-content").click();
+    await app.page.keyboard.type("2");
+    await app.page.getByRole("button", { name: "git", exact: true }).click();
+    await app.page.getByRole("button", { name: "Stage all" }).click();
+    await app.page.getByLabel("Commit message").fill("fix a");
+    await app.page.getByRole("button", { name: "Commit" }).click();
+    await app.page.getByRole("button", { name: /Push 1 commit\(s\) to me\/site/ }).click();
+    await app.page.waitForTimeout(400);
+    assert.match(await app.page.getByRole("status").last().innerText(), /Rejected: .*not a fast-forward/);
+    assert.equal(app.pushes[0].branch, "fix", "a new local branch pushes to the same name");
+    assert.ok(await app.page.getByRole("button", { name: /Push 1 commit\(s\)/ }).isVisible(), "still unpushed");
+    // Switching back to main restores main's contents.
+    await app.page.locator("#git-branch").selectOption("main");
+    await app.page.waitForTimeout(200);
+    // main's commit (the clone) tracks only site/; fix also committed the starter files,
+    // so like real git, switching to main takes them out of the working files.
+    assert.match(await app.page.getByRole("status").last().innerText(), /Switched to main: 5 file\(s\) updated/);
+    let state = await app.saved();
+    assert.equal(state.files.find((f) => f.name === "a.txt").content, "1");
+    assert.equal(state.files.some((f) => f.name === "neural_brain.py"), false);
+    await app.page.locator("#git-branch").selectOption("fix");
+    state = await app.saved();
+    assert.equal(state.files.find((f) => f.name === "a.txt").content, "12", "fix keeps its edit");
+    assert.ok(state.files.some((f) => f.name === "neural_brain.py"), "back on fix, the committed starter files return");
     await app.close();
   });
 });

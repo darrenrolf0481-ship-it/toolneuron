@@ -1,37 +1,50 @@
 /**
  * Real version history for the project, kept in the browser.
  *
- * Works like git's object model, reduced to one branch: file contents are
- * stored once as blobs (keyed by a content hash), a tree maps project paths
- * to blobs, the index is the tree that the next commit will record, and each
- * commit records its tree. So status, diff, log and restore compare real
- * contents. There is no remote: nothing here talks to GitHub.
+ * Works like git's object model: file contents are stored once as blobs
+ * (keyed by a content hash), a tree maps project paths to blobs, the index is
+ * the tree that the next commit will record, each commit records its tree and
+ * parent, and branches point at commits. So status, diff, log, restore,
+ * switch and merge compare real contents.
+ *
+ * Nothing here talks to GitHub: pushPlan() works out what a push must send,
+ * and the server (/api/git/push) sends it.
  *
  * Pure functions: every change returns a new GitState.
  */
-import type { GitCommit as Commit, GitState, GitTree as Tree, ProjectFile } from "./types.ts";
+import type { GitCommit as Commit, GitRemote as Remote, GitState, GitTree as Tree, ProjectFile } from "./types.ts";
 
-export type { Commit, GitState, Tree };
+export type { Commit, GitState, Remote, Tree };
 
 export const MAX_COMMITS = 50;
 /** Larger files are diffed as "changed" instead of line by line. */
 const DIFF_CELL_LIMIT = 2_000_000;
 const DIFF_MAX_LINES = 400;
 
-export const EMPTY_GIT: GitState = { initialized: false, branch: "main", staged: [], commits: [], index: {}, blobs: {} };
+export const EMPTY_GIT: GitState = { initialized: false, branch: "main", staged: [], commits: [], index: {}, blobs: {}, branches: { main: undefined } };
 
 /** Fills fields that older saves lack. */
 export function normalizeGit(raw: unknown): GitState {
   const git = (raw && typeof raw === "object" ? raw : {}) as Partial<GitState>;
   const commits = Array.isArray(git.commits) ? git.commits.filter((c) => c && typeof c.id === "string") : [];
-  const head = commits.find((commit) => commit.tree);
+  const branch = typeof git.branch === "string" && git.branch ? git.branch : "main";
+  // Saves from before branches existed: the one branch points at the newest commit.
+  const branches = git.branches && typeof git.branches === "object" ? { ...git.branches } : { [branch]: commits[0]?.id };
+  if (!(branch in branches)) branches[branch] = undefined;
+  const head = commits.find((commit) => commit.id === branches[branch]);
+  const remote =
+    git.remote && typeof git.remote.repo === "string"
+      ? { ...git.remote, dir: git.remote.dir ?? "", track: git.remote.track ?? {}, shas: git.remote.shas ?? {} }
+      : undefined;
   return {
     initialized: Boolean(git.initialized),
-    branch: typeof git.branch === "string" && git.branch ? git.branch : "main",
+    branch,
     staged: [],
     commits,
     index: git.index && typeof git.index === "object" ? git.index : { ...(head?.tree ?? {}) },
     blobs: git.blobs && typeof git.blobs === "object" ? git.blobs : {},
+    branches,
+    ...(remote ? { remote } : {}),
   };
 }
 
@@ -75,8 +88,33 @@ export function workingFiles(files: ProjectFile[], live?: { id: string; content:
   return out;
 }
 
+function byId(git: GitState, id: string | undefined): Commit | undefined {
+  return id === undefined ? undefined : git.commits.find((commit) => commit.id === id);
+}
+
+/** The current branch's head commit. */
 export function headCommit(git: GitState): Commit | undefined {
-  return git.commits[0];
+  const branches = git.branches ?? { [git.branch]: git.commits[0]?.id };
+  return byId(git, branches[git.branch]);
+}
+
+/** Commits from `from` back through parents, newest first (stops where history was trimmed). */
+export function history(git: GitState, from: string | undefined = headCommit(git)?.id): Commit[] {
+  const out: Commit[] = [];
+  const seen = new Set<string>();
+  let commit = byId(git, from);
+  while (commit && !seen.has(commit.id)) {
+    seen.add(commit.id);
+    out.push(commit);
+    commit = byId(git, commit.parent);
+  }
+  return out;
+}
+
+/** True when commit `ancestor` is `of` or one of its parents. */
+export function isAncestor(git: GitState, ancestor: string | undefined, of: string | undefined): boolean {
+  if (ancestor === undefined) return true;
+  return history(git, of).some((commit) => commit.id === ancestor);
 }
 
 export function headTree(git: GitState): Tree {
@@ -154,8 +192,15 @@ export function commit(git: GitState, message: string, time: string): GitState |
   const index = git.index ?? {};
   if (compareTrees(headTree(git), index).length === 0) return null;
   const parent = headCommit(git)?.id;
-  const id = hash(`${parent ?? ""}\n${time}\n${message}\n${JSON.stringify(index)}`).slice(0, 7);
-  const commits = [{ id, message, time, parent, tree: { ...index } }, ...git.commits].slice(0, MAX_COMMITS);
+  const id = hash(`${parent ?? ""}\n${time}\n${message}\n${JSON.stringify(index)}\n${git.commits.length}`).slice(0, 7);
+  const branches = { ...(git.branches ?? {}), [git.branch]: id };
+  return trim({ ...git, branches, commits: [{ id, message, time, parent, tree: { ...index } }, ...git.commits] });
+}
+
+/** Keeps the newest MAX_COMMITS commits plus every branch head, then drops unused blobs. */
+function trim(git: GitState): GitState {
+  const heads = new Set(Object.values(git.branches ?? {}).filter((id): id is string => Boolean(id)));
+  const commits = git.commits.filter((commit, index) => index < MAX_COMMITS || heads.has(commit.id));
   return collect({ ...git, commits });
 }
 
@@ -166,13 +211,150 @@ export function collect(git: GitState): GitState {
   return { ...git, blobs };
 }
 
-/** A commit by id or unique id prefix (at least 4 chars), or HEAD / HEAD~n. */
+/** A commit by id or unique id prefix (at least 4 chars), a branch name, or HEAD / HEAD~n / <branch>~n. */
 export function findCommit(git: GitState, ref: string): Commit | undefined {
-  const back = ref.match(/^HEAD(?:~(\d+))?$/i);
-  if (back) return git.commits[Number(back[1] ?? 0)];
-  if (ref.length < 4) return undefined;
-  const matches = git.commits.filter((commit) => commit.id.startsWith(ref));
-  return matches.length === 1 ? matches[0] : undefined;
+  const back = ref.match(/^(.+?)(?:~(\d+))?$/);
+  const base = back?.[1] ?? ref;
+  const steps = Number(back?.[2] ?? 0);
+  const start = /^HEAD$/i.test(base) ? headCommit(git)?.id : git.branches && base in git.branches ? git.branches[base] : undefined;
+  if (start !== undefined || /^HEAD$/i.test(base)) return history(git, start)[steps];
+  if (base.length < 4) return undefined;
+  const matches = git.commits.filter((commit) => commit.id.startsWith(base));
+  return matches.length === 1 ? history(git, matches[0].id)[steps] : undefined;
+}
+
+// ---------- branches ----------
+
+export const BRANCH_NAME = /^(?!-)(?!.*\.\.)(?!.*\/$)[A-Za-z0-9._/-]{1,60}$/;
+
+/** A file change to apply to the project: new contents, or null to delete. */
+export type FileChange = { path: string; content: string | null };
+
+/** What the working files must become to go from tree `from` to tree `to`. */
+export function treeChanges(git: GitState, from: Tree, to: Tree): FileChange[] {
+  return compareTrees(from, to).map((change) => ({ path: change.path, content: change.kind === "deleted" ? null : (blob(git, to[change.path]) ?? "") }));
+}
+
+/** Uncommitted work that switching or merging would overwrite: staged changes and edits to tracked files. */
+export function dirty(git: GitState, work: Record<string, string>): string[] {
+  const state = status(git, work);
+  return [...state.staged, ...state.unstaged].map((change) => change.path);
+}
+
+export function createBranch(git: GitState, name: string): GitState | string {
+  if (!BRANCH_NAME.test(name)) return `'${name}' is not a valid branch name`;
+  const branches = git.branches ?? {};
+  if (name in branches) return `a branch named '${name}' already exists`;
+  return { ...git, branches: { ...branches, [name]: headCommit(git)?.id } };
+}
+
+export function deleteBranch(git: GitState, name: string, force: boolean): GitState | string {
+  const branches = { ...(git.branches ?? {}) };
+  if (!(name in branches)) return `branch '${name}' not found`;
+  if (name === git.branch) return `cannot delete '${name}': it is the current branch`;
+  if (!force && !isAncestor(git, branches[name], headCommit(git)?.id)) return `'${name}' has commits not on ${git.branch}; use git branch -D to delete it anyway`;
+  delete branches[name];
+  const track = { ...(git.remote?.track ?? {}) };
+  delete track[name];
+  return trim({ ...git, branches, ...(git.remote ? { remote: { ...git.remote, track } } : {}) });
+}
+
+/**
+ * Switches to `name`, refusing when uncommitted work would be lost. Returns
+ * the new state and the file changes to apply.
+ */
+export function switchBranch(git: GitState, work: Record<string, string>, name: string): { git: GitState; changes: FileChange[] } | string {
+  const branches = git.branches ?? {};
+  if (!(name in branches)) return `branch '${name}' not found (git branch ${name} creates it)`;
+  if (name === git.branch) return `already on '${name}'`;
+  const pending = dirty(git, work);
+  if (pending.length) return `commit or restore your changes first: ${pending.slice(0, 5).join(", ")}${pending.length > 5 ? ", …" : ""}`;
+  const target = byId(git, branches[name])?.tree ?? {};
+  return { git: { ...git, branch: name, index: { ...target } }, changes: treeChanges(git, headTree(git), target) };
+}
+
+/** Fast-forward merge of `name` into the current branch (the only kind available). */
+export function mergeBranch(git: GitState, work: Record<string, string>, name: string): { git: GitState; changes: FileChange[]; note: string } | string {
+  const branches = git.branches ?? {};
+  if (!(name in branches)) return `branch '${name}' not found`;
+  const ours = headCommit(git)?.id;
+  const theirs = branches[name];
+  if (isAncestor(git, theirs, ours)) return { git, changes: [], note: "Already up to date." };
+  if (!isAncestor(git, ours, theirs)) return `${git.branch} and ${name} have diverged; only fast-forward merges are available (no merge commits or conflict resolution)`;
+  const pending = dirty(git, work);
+  if (pending.length) return `commit or restore your changes first: ${pending.slice(0, 5).join(", ")}`;
+  const target = byId(git, theirs)?.tree ?? {};
+  return {
+    git: { ...git, branches: { ...branches, [git.branch]: theirs }, index: { ...target } },
+    changes: treeChanges(git, headTree(git), target),
+    note: `Fast-forward ${ours ?? "(empty)"}..${theirs}`,
+  };
+}
+
+// ---------- remote (GitHub) ----------
+
+/** Paths under `dir`, made relative to it ("" = the whole tree). */
+export function subtree(tree: Tree, dir: string): Tree {
+  if (!dir) return { ...tree };
+  const prefix = `${dir}/`;
+  return Object.fromEntries(Object.entries(tree).filter(([path]) => path.startsWith(prefix)).map(([path, id]) => [path.slice(prefix.length), id]));
+}
+
+export function setRemote(git: GitState, repo: string, dir: string, track: Record<string, string> = {}, shas: Record<string, string> = {}): GitState {
+  return { ...git, remote: { repo, dir: dir.replace(/^\/+|\/+$/g, ""), track, shas } };
+}
+
+export function removeRemote(git: GitState): GitState {
+  const next = { ...git };
+  delete next.remote;
+  return next;
+}
+
+export type PushPlan = {
+  repo: string;
+  /** Remote branch to update. */
+  branch: string;
+  /**
+   * GitHub sha the new commits build on: the newest commit of this branch
+   * already on GitHub. The server only fast-forwards: the remote branch must
+   * be at this sha, or not exist yet. null = no commit of this branch is on
+   * GitHub (the remote branch must not exist).
+   */
+  parentSha: string | null;
+  /** Unpushed local commits, oldest first, as changes under the remote's folder. */
+  commits: { id: string; message: string; changes: FileChange[] }[];
+};
+
+/** What `git push` must send: every commit on the current branch after the newest one already on GitHub. */
+export function pushPlan(git: GitState): PushPlan | string {
+  const remote = git.remote;
+  if (!remote) return "no remote. git remote add origin owner/name [folder] (or clone a repo while GITHUB_TOKEN is set)";
+  const line = history(git);
+  if (line.length === 0) return "nothing to push: no commits yet";
+  const knownIndex = line.findIndex((commit) => remote.shas[commit.id]);
+  const branch = remote.track[git.branch] ?? git.branch;
+  if (knownIndex === 0) return `Everything up-to-date (${remote.repo} ${branch})`;
+  const pending = (knownIndex === -1 ? line : line.slice(0, knownIndex)).reverse();
+  const base = knownIndex === -1 ? undefined : line[knownIndex];
+  const parentSha = base ? remote.shas[base.id] : null;
+  let previous = subtree(base?.tree ?? {}, remote.dir);
+  const commits = pending.map((commit) => {
+    const tree = subtree(commit.tree ?? {}, remote.dir);
+    const changes = treeChanges(git, previous, tree);
+    previous = tree;
+    return { id: commit.id, message: commit.message, changes };
+  });
+  return { repo: remote.repo, branch, parentSha, commits };
+}
+
+/** Records the GitHub shas a push created. */
+export function markPushed(git: GitState, localIds: string[], shas: string[], remoteBranch: string): GitState {
+  if (!git.remote) return git;
+  const known = { ...git.remote.shas };
+  localIds.forEach((id, index) => {
+    if (shas[index]) known[id] = shas[index];
+  });
+  return { ...git, remote: { ...git.remote, shas: known, track: { ...git.remote.track, [git.branch]: remoteBranch } } };
 }
 
 export function blob(git: GitState, id: string | undefined): string | undefined {
@@ -256,6 +438,55 @@ export function diffText(path: string, before: string | undefined, after: string
     for (const op of hunk) out.push(`${op.kind}${op.text}`);
     k = end;
     if (out.length > DIFF_MAX_LINES) return [...out.slice(0, DIFF_MAX_LINES), "(diff cut)"];
+  }
+  return out;
+}
+
+// ---------- applying changes to project files ----------
+
+/**
+ * Applies path-based changes to the project's file list: updates contents,
+ * creates missing files (and their folders), deletes files. Folders left
+ * empty by a delete stay. `newId` makes ids for created items.
+ */
+export function applyChanges(
+  files: ProjectFile[],
+  changes: FileChange[],
+  newId: (n: number) => string,
+  language: (name: string) => string,
+): ProjectFile[] {
+  let out = [...files];
+  let made = 0;
+  const roots = out.filter((item) => item.parentId === null);
+  const projectRoot = roots.length === 1 && roots[0].type === "folder" ? roots[0].id : null;
+  const childNamed = (parentId: string | null, name: string) => out.find((item) => item.parentId === parentId && item.name === name);
+  for (const change of changes) {
+    const parts = change.path.split("/");
+    const name = parts.pop()!;
+    let parentId: string | null = projectRoot;
+    let missingFolder = false;
+    for (const folder of parts) {
+      let next = childNamed(parentId, folder);
+      if (!next) {
+        if (change.content === null) {
+          missingFolder = true;
+          break;
+        }
+        next = { id: newId(made++), name: folder, type: "folder", parentId, isOpen: false };
+        out.push(next);
+      }
+      parentId = next.id;
+    }
+    if (missingFolder) continue;
+    const existing = childNamed(parentId, name);
+    if (change.content === null) {
+      if (existing && existing.type === "file") out = out.filter((item) => item.id !== existing.id);
+    } else if (existing && existing.type === "file") {
+      const content = change.content;
+      out = out.map((item) => (item.id === existing.id ? { ...item, content } : item));
+    } else if (!existing) {
+      out.push({ id: newId(made++), name, type: "file", parentId, language: language(name), content: change.content });
+    }
   }
   return out;
 }

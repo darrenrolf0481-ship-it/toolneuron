@@ -108,7 +108,10 @@ export type OsState = {
   /** Commits the index; false when nothing is staged. */
   gitCommit: (message: string) => boolean;
   /** Sets git state and writes restored contents into existing files. */
-  applyGit: (git: GitState, writes?: { fileId: string; content: string }[]) => void;
+  /** Sets git state and applies file changes (restore, checkout, switch, merge). */
+  applyGit: (git: GitState, changes?: Git.FileChange[]) => void;
+  /** Pushes the current branch's unpushed commits to the linked GitHub repo. */
+  gitPush: () => Promise<{ ok: boolean; message: string }>;
   /** Copies a public GitHub repo's text files into the project (owner/name). */
   cloneRepo: (repo: string) => Promise<void>;
   addPack: (pack: Pack) => void;
@@ -610,18 +613,60 @@ export const useOs = create<OsState>((set, get) => ({
     set({ git: next });
     return true;
   },
-  applyGit: (git, writes = []) => {
+  applyGit: (git, changes = []) => {
+    get().flushDraft();
     const state = get();
-    const byId = new Map(writes.map((write) => [write.fileId, write.content]));
+    if (changes.length === 0) {
+      set({ git });
+      return;
+    }
+    const stampId = Date.now().toString(36);
+    const files = Git.applyChanges(state.files, changes, (n) => `git_${stampId}_${n}`, languageFromName);
+    const active = files.find((file) => file.id === state.activeFileId && file.type === "file");
+    const fallback = active ?? files.find((file) => file.type === "file");
     set({
       git,
-      files: byId.size ? state.files.map((file) => (byId.has(file.id) ? { ...file, content: byId.get(file.id) } : file)) : state.files,
-      ...(byId.has(state.activeFileId) ? { draft: byId.get(state.activeFileId)! } : {}),
+      files,
+      activeFileId: fallback?.id ?? "",
+      draft: fallback?.content ?? "",
+      workFileId: files.some((file) => file.id === state.workFileId) ? state.workFileId : (fallback?.id ?? ""),
     });
+  },
+  gitPush: async () => {
+    const say = (lines: string[]) => get().pushTerminal(lines);
+    const done = (ok: boolean, message: string, extra: string[] = []) => {
+      say([`${ok ? (message.startsWith("Everything") ? "[INFO]" : "[SUCCESS]") : "[ERROR]"} ${message}`, ...extra]);
+      return { ok, message };
+    };
+    const git = Git.normalizeGit(get().git);
+    const plan = Git.pushPlan(git);
+    if (typeof plan === "string") return done(plan.startsWith("Everything"), plan);
+    say([`Pushing ${plan.commits.length} commit(s) to ${plan.repo} ${plan.branch}…`]);
+    let result: { ok: boolean; error?: string; shas?: string[]; url?: string; created?: boolean };
+    try {
+      const response = await fetch("/api/git/push", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(plan) });
+      result = await response.json();
+    } catch {
+      return done(false, "The push request failed (network).");
+    }
+    if (!result.ok || !result.shas) return done(false, result.error ?? "Push failed.");
+    // Record against the state as it is now (the user may have kept working).
+    set({ git: Git.markPushed(Git.normalizeGit(get().git), plan.commits.map((commit) => commit.id), result.shas, plan.branch) });
+    return done(true, `${result.created ? "Created" : "Updated"} ${plan.repo} ${plan.branch}: ${plan.commits.length} commit(s), now at ${result.shas.at(-1)?.slice(0, 7)}`, [`[INFO] ${result.url}`]);
   },
   cloneRepo: async (repo) => {
     const say = (lines: string[]) => get().pushTerminal(lines);
-    let result: { ok: boolean; error?: string; files?: { path: string; content: string }[]; skipped?: Record<string, number> };
+    let result: {
+      ok: boolean;
+      error?: string;
+      files?: { path: string; content: string }[];
+      skipped?: Record<string, number>;
+      /** Set when the server has a token: the copy can be linked for push. */
+      linked?: boolean;
+      sha?: string;
+      branch?: string;
+      private?: boolean;
+    };
     try {
       const response = await fetch("/api/clone", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo }) });
       result = await response.json();
@@ -660,15 +705,35 @@ export const useOs = create<OsState>((set, get) => ({
       const fileName = parts.pop()!;
       additions.push({ id: `${rootId}_f${index}`, name: fileName, type: "file", parentId: folderFor(parts.join("/")), language: languageFromName(fileName), content: item.content });
     });
-    set({ files: [...state.files, ...additions] });
+    const files = [...state.files, ...additions];
+    set({ files });
     const skipped = Object.entries(result.skipped ?? {})
       .filter(([, count]) => count > 0)
       .map(([reason, count]) => `${count} ${reason.replace(/[A-Z]/g, (c) => ` ${c.toLowerCase()}`)}`);
-    say([
-      `[SUCCESS] Copied ${result.files.length} text file(s) from github.com/${repo} into project/${name}/`,
-      ...(skipped.length ? [`[INFO] left out: ${skipped.join(", ")}`] : []),
-      "[INFO] This is a copy, not a linked clone: there is no remote to pull from or push to.",
-    ]);
+    const lines = [
+      `[SUCCESS] Copied ${result.files.length} text file(s) from github.com/${repo}${result.private ? " (private)" : ""} into project/${name}/`,
+      ...(skipped.length ? [`[INFO] left out: ${skipped.join(", ")}. They stay on GitHub untouched when you push.`] : []),
+    ];
+    const git = Git.normalizeGit(get().git);
+    if (result.linked && result.sha && result.branch && !git.remote) {
+      // Record the copy as a commit that is already on GitHub, so later commits push on top of it.
+      const dir = Git.pathOf(additions[0], files);
+      const paths = Object.keys(Git.workingFiles(files)).filter((path) => path.startsWith(`${dir}/`));
+      const staged = Git.add(git.initialized ? git : Git.init(git), Git.workingFiles(files), paths).git;
+      const committed = Git.commit(staged, `Clone of ${repo} at ${result.sha.slice(0, 7)}`, new Date().toLocaleString()) ?? staged;
+      const head = Git.headCommit(committed);
+      const linked = Git.setRemote(committed, repo, dir, { [committed.branch]: result.branch }, head ? { [head.id]: result.sha } : {});
+      set({ git: linked });
+      lines.push(
+        `[INFO] Linked: project/${dir}/ pushes to ${repo} (${committed.branch} → ${result.branch}). Commit there, then git push.`,
+        "[INFO] Pull is not available: to pick up changes made on GitHub, clone again.",
+      );
+    } else if (result.linked && git.remote) {
+      lines.push(`[INFO] A plain copy: this project already pushes to ${git.remote.repo} (one remote per project).`);
+    } else {
+      lines.push("[INFO] A plain copy with no link back. Set GITHUB_TOKEN on the server to link clones for push (and to clone private repos).");
+    }
+    say(lines);
   },
   addPack: (pack) => set({ packs: [pack, ...get().packs] }),
   togglePack: (id) => set({ packs: get().packs.map((pack) => (pack.id === id ? { ...pack, armed: !pack.armed } : pack)) }),
@@ -813,7 +878,11 @@ export const useOs = create<OsState>((set, get) => ({
           provider: get().provider,
         },
       });
-      get().pushTerminal([result.ok ? `CORE (${persona.name.toUpperCase()}): ${result.text}` : `[ERROR] ${result.error}`]);
+      get().pushTerminal(
+        result.ok
+          ? [...(result.note ? [`[INFO] ${result.note.slice(0, 200)}`] : []), `CORE (${persona.name.toUpperCase()}): ${result.text}`]
+          : [`[ERROR] ${result.error}`],
+      );
     } catch {
       get().pushTerminal(["[ERROR] The AI link dropped."]);
     } finally {

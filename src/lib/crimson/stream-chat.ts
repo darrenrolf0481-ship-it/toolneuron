@@ -1,7 +1,7 @@
 import type { ChatInput } from "./chat-input";
 
 export type StreamResult =
-  | { ok: true; text: string; model?: string; /** Hit the token limit mid-reply. */ cut?: boolean; /** Another provider answered after the chosen one failed. */ note?: string }
+  | { ok: true; text: string; model?: string; /** Provider id that answered. */ provider?: string; /** Hit the token limit mid-reply. */ cut?: boolean; /** Another provider answered after the chosen one failed. */ note?: string }
   | { ok: false; text: string; error: string; stopped?: boolean };
 
 /** Streams a reply from /api/chat, calling onDelta with the text so far. Abort the signal to stop. */
@@ -12,6 +12,7 @@ export async function streamChat(
   let text = "";
   let error: string | null = null;
   let model: string | undefined;
+  let provider: string | undefined;
   let truncated = false;
   let note: string | undefined;
   try {
@@ -35,7 +36,7 @@ export async function streamChat(
         const row = buffer.slice(0, cut);
         buffer = buffer.slice(cut + 1);
         if (!row.trim()) continue;
-        let event: { t?: string; v?: unknown; model?: unknown; cut?: unknown };
+        let event: { t?: string; v?: unknown; model?: unknown; cut?: unknown; provider?: unknown };
         try {
           event = JSON.parse(row);
         } catch {
@@ -51,6 +52,7 @@ export async function streamChat(
           error = event.v;
         } else if (event.t === "done") {
           if (typeof event.model === "string") model = event.model;
+          if (typeof event.provider === "string") provider = event.provider;
           if (event.cut === true) truncated = true;
         }
       }
@@ -61,5 +63,5 @@ export async function streamChat(
   }
   if (signal.aborted) return { ok: false, text, error: "Stopped.", stopped: true };
   if (error) return { ok: false, text, error };
-  return { ok: true, text, model, cut: truncated, note };
+  return { ok: true, text, model, provider, cut: truncated, note };
 }

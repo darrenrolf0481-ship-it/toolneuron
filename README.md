@@ -26,15 +26,21 @@ that shaped the work, plus the design notes for the swarm and the skills.
   `python`, `node`, `ai`, `git`, `gh repo clone`). It is not a shell: other
   commands are refused.
 - **Git, for real, in the browser.** `git init/status/add/commit/log/diff/
-  show/restore` and `git checkout <commit> -- <path>` work on real snapshots
-  (content-addressed blobs, an index, up to 50 commits). One branch, no
-  remote: push and pull are not available. The editor's Git tab shows the
-  same status and diffs.
-- **Clone public GitHub repos.** `gh repo clone owner/name` downloads the
-  repo's archive on the server and copies its text files into the project
-  (up to 300 files / 1 MB; binaries and `node_modules`-style folders are left
-  out). It is a copy with no link back. Private repos need sign-in, which is
-  not built.
+  show/restore`, `git checkout <commit> -- <path>`, branches (`git branch`,
+  `switch [-c]`, `checkout [-b]`, `branch -d`) and fast-forward `merge` work
+  on real snapshots (content-addressed blobs, an index, the newest 50 commits
+  plus branch heads). The editor's Git tab shows status, per-file diffs,
+  branches and a Push button.
+- **Clone and push with GitHub.** `gh repo clone owner/name` downloads the
+  repo on the server and copies its text files into a project folder (up to
+  300 files / 1 MB; binaries and `node_modules`-style folders are left out).
+  With `GITHUB_TOKEN` set, private repos work too, and the folder is linked:
+  commit inside it and `git push` sends each commit to GitHub as a real
+  commit (files left out of the copy stay untouched). New local branches
+  push to new GitHub branches. Push only fast-forwards and never forces; if
+  GitHub has commits you don't, it is refused. Pull is not built: clone again
+  to pick up changes. `git remote add origin owner/name [folder]` links a
+  folder to a repo branch that does not exist yet.
 - **Knowledge packs (Database).** Upload text files (up to 120K characters
   each); each chat message gets the sections that match it (keyword search),
   not just the start of the file.
@@ -78,8 +84,9 @@ Set in `.env`; see `.env.example` and the header of
 | `OMNIROUTE_BASE_URL`, `OMNIROUTE_API_KEY`, `OMNIROUTE_MODEL` | OmniRoute gateway and model (e.g. `auto/coding:free`) |
 | `AI_MAX_TOKENS_FAST`, `AI_MAX_TOKENS` | Reply caps for Flash / Precise (default 420 / 900) |
 | `OPENROUTER_REASONING_EFFORT`, `OMNIROUTE_REASONING_EFFORT` | `low` / `medium` / `high`: keeps a reasoning model's thinking short |
-| `AI_FALLBACK` | `off` stops chat from trying the other providers when the chosen one fails before answering |
-| `CLONE_PER_MIN` | Clones allowed per client per minute (default 4) |
+| `AI_FALLBACK` | `off` stops chat, the terminal's `ai` and the Swarm from trying the other providers when the chosen one fails before answering |
+| `CLONE_PER_MIN` | Clones and pushes allowed per client per minute (default 4) |
+| `GITHUB_TOKEN` | Enables push and private clones. Prefer a fine-grained token limited to the repos you want, with Contents: read & write. Stays on the server |
 
 **Free models.** Most free models are reasoning models: they think before
 answering, and the thinking counts against the reply cap. With the default
@@ -129,6 +136,7 @@ check what a real model says. `BASE_URL` overrides the default
 | `src/lib/crimson/git.ts` | Version history: blobs, index, commits, status, diff (pure, tested) |
 | `src/lib/crimson/knowledge.ts` | Knowledge-pack sections and search (pure, tested) |
 | `src/lib/crimson/tar.ts`, `src/routes/api/clone.ts` | Reading GitHub archives; the clone endpoint |
+| `src/routes/api/git/push.ts`, `src/lib/crimson/github.server.ts` | Push: replays commits with GitHub's Git Data API |
 | `src/lib/crimson/swarm/` | Swarm review protocol and engine |
 | `src/lib/crimson/vault/` | Vault crypto, passkeys, storage |
 | `src/components/crimson/` | The UI |

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { findFile, interpret, parseRepo, resolvePath, type TermCtx, type TermEffect } from "./terminal.ts";
-import { EMPTY_GIT } from "./git.ts";
+import { applyChanges, EMPTY_GIT } from "./git.ts";
 import type { GitState } from "./types.ts";
 import type { ProjectFile } from "./types.ts";
 
@@ -63,24 +63,24 @@ describe("run", () => {
   });
 });
 
-describe("git (real history)", () => {
-  /** Runs commands in sequence, applying git effects and file writes like the app does. */
-  function session(commands: string[], start: ProjectFile[] = files, cwd = `${ROOT}/project`) {
-    let state: GitState = { ...EMPTY_GIT };
-    let current = start.map((file) => ({ ...file }));
-    const out: string[][] = [];
-    for (const command of commands) {
-      const result = interpret(command, { cwd, files: current, git: state });
-      out.push(result.lines);
-      const effect = result.effect as TermEffect | undefined;
-      if (effect?.type === "git") {
-        state = effect.git;
-        for (const write of effect.writes ?? []) current = current.map((file) => (file.id === write.fileId ? { ...file, content: write.content } : file));
-      }
+/** Runs commands in sequence, applying git effects and file writes like the app does. */
+function session(commands: string[], start: ProjectFile[] = files, cwd = `${ROOT}/project`) {
+  let state: GitState = { ...EMPTY_GIT };
+  let current = start.map((file) => ({ ...file }));
+  const out: string[][] = [];
+  for (const command of commands) {
+    const result = interpret(command, { cwd, files: current, git: state });
+    out.push(result.lines);
+    const effect = result.effect as TermEffect | undefined;
+    if (effect?.type === "git") {
+      state = effect.git;
+      current = applyChanges(current, effect.changes ?? [], (n) => `new${n}`, () => "text");
     }
-    return { out, state, files: current, edit: (id: string, content: string) => (current = current.map((file) => (file.id === id ? { ...file, content } : file))) };
   }
+  return { out, state, files: current, edit: (id: string, content: string) => (current = current.map((file) => (file.id === id ? { ...file, content } : file))) };
+}
 
+describe("git (real history)", () => {
   it("init, add ., commit, then a clean status and a log entry", () => {
     const { out, state } = session(["git status", "git init", "git add .", 'git commit -m "first commit"', "git status", "git log"]);
     assert.match(out[0][0], /Not a repository/);
@@ -99,7 +99,7 @@ describe("git (real history)", () => {
     const live = interpret("git diff", { cwd: `${ROOT}/project`, files: s.files, git: s.state, live: { id: "a", content: "print(3)" } });
     assert.ok(live.lines.includes("-print(1)") && live.lines.includes("+print(3)"), live.lines.join("|"));
     const restored = interpret("git restore src/main.py", { cwd: `${ROOT}/project`, files: edited, git: s.state });
-    assert.deepEqual((restored.effect as Extract<TermEffect, { type: "git" }>).writes, [{ fileId: "a", content: "print(1)" }]);
+    assert.deepEqual((restored.effect as Extract<TermEffect, { type: "git" }>).changes, [{ path: "src/main.py", content: "print(1)" }]);
   });
 
   it("checkout <commit> -- <path> brings back an older version; show prints the commit's diff", () => {
@@ -113,7 +113,7 @@ describe("git (real history)", () => {
     const shown = interpret("git show", { cwd: `${ROOT}/project`, files: edited, git: s3 }).lines;
     assert.ok(shown.includes("-# hi") && shown.includes("+# changed"), shown.join("|"));
     const back = interpret(`git checkout ${first} -- README.md`, { cwd: `${ROOT}/project`, files: edited, git: s3 });
-    assert.deepEqual((back.effect as Extract<TermEffect, { type: "git" }>).writes, [{ fileId: "d", content: "# hi" }]);
+    assert.deepEqual((back.effect as Extract<TermEffect, { type: "git" }>).changes, [{ path: "README.md", content: "# hi" }]);
   });
 
   it("paths are relative to the cwd, and folders expand", () => {
@@ -124,11 +124,57 @@ describe("git (real history)", () => {
   });
 
   it("nothing to commit, unknown paths and remote commands are reported plainly", () => {
-    const { out } = session(["git init", 'git commit -m "empty"', "git add nope.py", "git push", "git checkout main"]);
+    const { out } = session(["git init", 'git commit -m "empty"', "git add nope.py", "git push", "git pull", "git checkout main"]);
     assert.match(out[1][0], /Nothing staged/);
     assert.match(out[2][0], /did not match any files/);
-    assert.match(out[3][0], /not available: .*no remote/);
-    assert.match(out[4][0], /one branch only/);
+    assert.match(out[3][0], /no remote/);
+    assert.match(out[4][0], /not available/);
+    assert.match(out[5][0], /already on 'main'/);
+  });
+});
+
+describe("git branches", () => {
+  it("branch, switch, commit, switch back (files follow), fast-forward merge, delete", () => {
+    const s = session(["git init", "git add .", 'git commit -m "base"', "git switch -c feature", "git branch"]);
+    assert.match(s.out[3][0], /Switched to a new branch 'feature'/);
+    assert.deepEqual(s.out[4], ["* feature  " + s.state.branches!.feature, "  main  " + s.state.branches!.main]);
+    // Commit a change on feature, including a new file.
+    let state = s.state;
+    let current = applyChanges(s.files, [{ path: "src/main.py", content: "print('feature')" }, { path: "NEW.md", content: "new" }], (n) => `n${n}`, () => "text");
+    const run = (command: string) => {
+      const result = interpret(command, { cwd: `${ROOT}/project`, files: current, git: state });
+      if (result.effect?.type === "git") {
+        state = result.effect.git;
+        current = applyChanges(current, result.effect.changes ?? [], (n) => `m${n}${Math.random()}`, () => "text");
+      }
+      return result.lines;
+    };
+    run("git add .");
+    run('git commit -m "feature work"');
+    assert.match(run("git switch main")[0], /Switched to branch 'main' \(2 file\(s\) updated\)/);
+    assert.equal(current.find((f) => f.id === "a")!.content, "print(1)");
+    assert.equal(current.some((f) => f.name === "NEW.md"), false, "new file removed on main");
+    assert.match(run("git merge feature")[0], /Fast-forward/);
+    assert.equal(current.find((f) => f.id === "a")!.content, "print('feature')");
+    assert.ok(current.some((f) => f.name === "NEW.md"));
+    assert.match(run("git merge feature")[0], /Already up to date/);
+    assert.match(run("git branch -d feature")[0], /Deleted branch feature/);
+  });
+  it("refuses to switch with uncommitted changes, and diverged merges", () => {
+    const s = session(["git init", "git add .", 'git commit -m "base"', "git branch other"]);
+    const edited = s.files.map((f) => (f.id === "a" ? { ...f, content: "dirty" } : f));
+    assert.match(interpret("git switch other", { cwd: `${ROOT}/project`, files: edited, git: s.state }).lines[0], /commit or restore your changes first: src\/main\.py/);
+    assert.match(interpret("git branch bad..name", { cwd: ROOT, files, git: s.state }).lines[0], /not a valid branch name/);
+  });
+});
+
+describe("git remote and push", () => {
+  it("adds a remote for a folder and plans a push", () => {
+    const s = session(["git init", "git remote add origin me/site src", "git add .", 'git commit -m "first"', "git remote", "git push"]);
+    assert.match(s.out[1][0], /origin → me\/site, from project\/src/);
+    assert.match(s.out[4][0], /github\.com\/me\/site/);
+    assert.deepEqual(interpret("git push", { cwd: ROOT, files, git: s.state }).effect, { type: "push" });
+    assert.match(interpret("git remote add origin me/x nowhere", { cwd: `${ROOT}/project`, files, git: { ...s.state, remote: undefined } }).lines[0], /has no files/);
   });
 });
 

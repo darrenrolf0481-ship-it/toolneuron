@@ -103,6 +103,21 @@ export type GitState = {
   index?: GitTree;
   /** Hash → contents, for every blob a commit or the index refers to. */
   blobs?: Record<string, string>;
+  /** Branch name → its head commit id (undefined before the first commit). */
+  branches?: Record<string, string | undefined>;
+  /** The GitHub repository this project pushes to, if linked. */
+  remote?: GitRemote;
+};
+
+export type GitRemote = {
+  /** owner/name on GitHub. */
+  repo: string;
+  /** Project folder that maps to the repo root ("" = the whole project). */
+  dir: string;
+  /** Local branch → remote branch it pushes to (default: same name). */
+  track: Record<string, string>;
+  /** Local commit id → GitHub commit sha, for every commit known to be on GitHub. */
+  shas: Record<string, string>;
 };
 
 export type EditorMode = "code" | "preview" | "git";

@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { completionBody, NO_PROVIDER_ERROR, normalizeChatInput, upstreamError } from "./chat-input";
+import type { ProviderConfig } from "./providers.server";
 
 /*
  * Server-only modules are loaded with `await import()` inside handlers so Vite
@@ -40,44 +41,68 @@ export const askCrimson = createServerFn({ method: "POST" })
     const { guardAiCall } = await import("./access.server");
     const refused = guardAiCall();
     if (refused) return { ok: false as const, error: refused };
-    const { resolveProvider, tokenCaps } = await import("./providers.server");
-    const provider = resolveProvider(data.provider);
-    if (!provider) {
+    const { fallbackOrder, resolveProvider, tokenCaps } = await import("./providers.server");
+    const first = resolveProvider(data.provider);
+    if (!first) {
       return { ok: false as const, error: NO_PROVIDER_ERROR };
     }
     if (data.messages.length === 0) {
       return { ok: false as const, error: "Empty directive." };
     }
-
-    const headers: Record<string, string> = { "Content-Type": "application/json", ...provider.headers };
-    if (provider.apiKey) headers.Authorization = `Bearer ${provider.apiKey}`;
-
-    let response: Response;
-    try {
-      response = await fetch(`${provider.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers,
-        signal: AbortSignal.timeout(90_000),
-        body: JSON.stringify(completionBody(data, data.fast ? provider.fastModel : provider.model, false, { caps: tokenCaps(), extra: provider.extra })),
-      });
-    } catch (error) {
-      const timedOut = error instanceof DOMException && error.name === "TimeoutError";
-      return {
-        ok: false as const,
-        error: timedOut ? `${provider.label} timed out.` : `Could not reach ${provider.label}.`,
-      };
+    // Same fallback as /api/chat: if the chosen provider fails, try the next configured one.
+    const failures: string[] = [];
+    for (const provider of fallbackOrder(first)) {
+      const attempt = await completeOnce(provider, data, tokenCaps());
+      if (attempt.ok) {
+        return {
+          ok: true as const,
+          text: attempt.text,
+          provider: provider.id,
+          model: attempt.model,
+          note: failures.length ? `Answered by ${provider.label}. ${failures.join(" ")}` : undefined,
+        };
+      }
+      failures.push(attempt.error);
+      if (attempt.timedOut) break;
     }
-
-    if (!response.ok) return { ok: false as const, error: await upstreamError(provider.label, response) };
-
-    const body = (await response.json().catch(() => ({}))) as {
-      choices?: { message?: { content?: string | { type?: string; text?: string }[] } }[];
-      model?: string;
-    };
-    const content = body.choices?.[0]?.message?.content;
-    const text = (
-      Array.isArray(content) ? content.map((part) => (part?.type === "text" ? (part.text ?? "") : "")).join("") : content
-    )?.trim();
-    if (!text) return { ok: false as const, error: `${provider.label} returned an empty reply.` };
-    return { ok: true as const, text, provider: provider.id, model: body.model };
+    return { ok: false as const, error: failures.join(" ") };
   });
+
+/** One non-streaming completion from one provider. */
+async function completeOnce(
+  provider: ProviderConfig,
+  data: ReturnType<typeof normalizeChatInput>,
+  caps: { fast: number; precise: number },
+): Promise<{ ok: true; text: string; model?: string } | { ok: false; error: string; timedOut?: boolean }> {
+  const headers: Record<string, string> = { "Content-Type": "application/json", ...provider.headers };
+  if (provider.apiKey) headers.Authorization = `Bearer ${provider.apiKey}`;
+  let response: Response;
+  try {
+    response = await fetch(`${provider.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers,
+      signal: AbortSignal.timeout(90_000),
+      body: JSON.stringify(completionBody(data, data.fast ? provider.fastModel : provider.model, false, { caps, extra: provider.extra })),
+    });
+  } catch (error) {
+    const timedOut = error instanceof DOMException && error.name === "TimeoutError";
+    return { ok: false, error: timedOut ? `${provider.label} timed out.` : `Could not reach ${provider.label}.`, timedOut };
+  }
+  if (!response.ok) return { ok: false, error: await upstreamError(provider.label, response) };
+  const body = (await response.json().catch(() => ({}))) as {
+    choices?: { message?: { content?: string | { type?: string; text?: string }[] }; finish_reason?: string }[];
+    model?: string;
+    error?: { message?: string } | string;
+  };
+  const content = body.choices?.[0]?.message?.content;
+  const text = (Array.isArray(content) ? content.map((part) => (part?.type === "text" ? (part.text ?? "") : "")).join("") : content)?.trim();
+  if (!text) {
+    const detail = typeof body.error === "string" ? body.error : body.error?.message;
+    if (detail) return { ok: false, error: `${provider.label}: ${String(detail).slice(0, 200)}` };
+    return {
+      ok: false,
+      error: body.choices?.[0]?.finish_reason === "length" ? `${provider.label} spent its whole token budget thinking and wrote no answer.` : `${provider.label} returned an empty reply.`,
+    };
+  }
+  return { ok: true, text, model: body.model };
+}

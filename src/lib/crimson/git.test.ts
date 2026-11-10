@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { add, collect, commit, diffText, EMPTY_GIT, findCommit, hash, init, MAX_COMMITS, normalizeGit, pathOf, status, unstage, workingFiles } from "./git.ts";
+import { add, applyChanges, collect, commit, createBranch, diffText, EMPTY_GIT, findCommit, hash, history, init, markPushed, MAX_COMMITS, mergeBranch, normalizeGit, pathOf, pushPlan, setRemote, status, subtree, switchBranch, unstage, workingFiles } from "./git.ts";
 import type { ProjectFile } from "./types.ts";
 
 const files: ProjectFile[] = [
@@ -96,5 +96,88 @@ describe("diffText", () => {
   it("refuses to line-diff huge files", () => {
     const big = Array.from({ length: 3000 }, (_, i) => `line ${i}`).join("\n");
     assert.match(diffText("big.txt", big, big + "\nmore").at(-1)!, /too large to diff/);
+  });
+});
+
+describe("branches", () => {
+  const base = commit(add(init(EMPTY_GIT), { "a.txt": "1" }, ["."]).git, "base", "t0")!;
+  it("history follows the current branch only", () => {
+    const branched = createBranch(base, "topic");
+    assert.ok(typeof branched !== "string");
+    const onTopic = commit(add({ ...branched, branch: "topic" }, { "a.txt": "2" }, ["."]).git, "topic work", "t1")!;
+    assert.deepEqual(history(onTopic).map((c) => c.message), ["topic work", "base"]);
+    assert.deepEqual(history({ ...onTopic, branch: "main" }).map((c) => c.message), ["base"]);
+    assert.equal(findCommit(onTopic, "main")?.message, "base");
+    assert.equal(findCommit(onTopic, "topic~1")?.message, "base");
+  });
+  it("switch returns the file changes; merge fast-forwards or refuses divergence", () => {
+    const topic = createBranch(base, "topic") as typeof base;
+    const ahead = commit(add({ ...topic, branch: "topic" }, { "a.txt": "2", "b.txt": "new" }, ["."]).git, "ahead", "t1")!;
+    const back = switchBranch(ahead, { "a.txt": "2", "b.txt": "new" }, "main");
+    assert.ok(typeof back !== "string");
+    assert.deepEqual(back.changes, [{ path: "a.txt", content: "1" }, { path: "b.txt", content: null }]);
+    const merged = mergeBranch(back.git, { "a.txt": "1" }, "topic");
+    assert.ok(typeof merged !== "string");
+    assert.equal(merged.git.branches!.main, merged.git.branches!.topic);
+    const diverged = commit(add(back.git, { "a.txt": "3" }, ["."]).git, "main work", "t2")!;
+    assert.match(mergeBranch(diverged, { "a.txt": "3" }, "topic") as string, /diverged/);
+  });
+  it("old saves get one branch at the newest commit", () => {
+    const old = normalizeGit({ initialized: true, branch: "main", commits: [{ id: "abc1234", message: "m", time: "t", tree: {} }] });
+    assert.deepEqual(old.branches, { main: "abc1234" });
+  });
+});
+
+describe("push plan", () => {
+  const sha = (n: number) => String(n).repeat(40).slice(0, 40);
+  it("sends commits after the newest one already on GitHub, as changes under the remote folder", () => {
+    let git = commit(add(init(EMPTY_GIT), { "site/index.html": "v1", "notes.txt": "x" }, ["."]).git, "clone", "t0")!;
+    git = setRemote(git, "me/site", "site", { main: "main" }, { [git.branches!.main!]: sha(1) });
+    assert.match(pushPlan(git) as string, /Everything up-to-date/);
+    git = commit(add(git, { "site/index.html": "v2", "notes.txt": "y" }, ["."]).git, "edit", "t1")!;
+    git = commit(add(git, { "site/about.html": "a", "notes.txt": "y" }, ["."]).git, "about, remove index", "t2")!;
+    const plan = pushPlan(git);
+    assert.ok(typeof plan !== "string");
+    assert.equal(plan.parentSha, sha(1));
+    assert.deepEqual(plan.commits.map((c) => [c.message, c.changes]), [
+      ["edit", [{ path: "index.html", content: "v2" }]],
+      ["about, remove index", [{ path: "about.html", content: "a" }, { path: "index.html", content: null }]],
+    ]);
+    const pushed = markPushed(git, plan.commits.map((c) => c.id), [sha(2), sha(3)], "main");
+    assert.match(pushPlan(pushed) as string, /Everything up-to-date/);
+  });
+  it("a new branch pushes from where it left the pushed history", () => {
+    let git = commit(add(init(EMPTY_GIT), { "f.txt": "1" }, ["."]).git, "base", "t0")!;
+    git = setRemote(git, "me/r", "", {}, { [git.branches!.main!]: sha(4) });
+    git = { ...(createBranch(git, "fix") as typeof git), branch: "fix" };
+    git = commit(add(git, { "f.txt": "2" }, ["."]).git, "fix it", "t1")!;
+    const plan = pushPlan(git);
+    assert.ok(typeof plan !== "string");
+    assert.equal(plan.branch, "fix");
+    assert.equal(plan.parentSha, sha(4));
+    assert.equal(plan.commits.length, 1);
+  });
+  it("needs a remote and a commit", () => {
+    assert.match(pushPlan(init(EMPTY_GIT)) as string, /no remote/);
+    assert.match(pushPlan(setRemote(init(EMPTY_GIT), "me/r", "")) as string, /no commits/);
+  });
+  it("subtree keeps only the folder, relative to it", () => {
+    assert.deepEqual(subtree({ "a/x": "1", "ab/y": "2", "a/b/z": "3" }, "a"), { x: "1", "b/z": "3" });
+  });
+});
+
+describe("applyChanges", () => {
+  it("updates, creates (with folders) and deletes by path", () => {
+    const out = applyChanges(
+      files,
+      [{ path: "src/main.py", content: "print(9)" }, { path: "docs/guide/intro.md", content: "# intro" }, { path: "README.md", content: null }, { path: "gone/x.txt", content: null }],
+      (n) => `id${n}`,
+      (name) => (name.endsWith(".md") ? "markdown" : "text"),
+    );
+    assert.equal(out.find((f) => f.id === "a")!.content, "print(9)");
+    assert.equal(out.some((f) => f.id === "b"), false);
+    const intro = out.find((f) => f.name === "intro.md")!;
+    assert.equal(pathOf(intro, out), "docs/guide/intro.md");
+    assert.equal(intro.language, "markdown");
   });
 });

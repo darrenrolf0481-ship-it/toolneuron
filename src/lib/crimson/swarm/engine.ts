@@ -135,7 +135,7 @@ function patchFix(api: Api, patch: Partial<SwarmFix>) {
   if (fix) api.set({ swarmFix: { ...fix, ...patch } });
 }
 
-type Answer = { ok: true; text: string } | { ok: false; error: string; kind: "rate" | "locked" | "stopped" | "timeout" | "other" };
+type Answer = { ok: true; text: string; /** Provider that answered (may be a fallback). */ provider?: string } | { ok: false; error: string; kind: "rate" | "locked" | "stopped" | "timeout" | "other" };
 
 /** One model call with a 30s limit and one retry on network errors only. */
 async function ask(
@@ -159,7 +159,7 @@ async function ask(
       { system: opts.system, messages: [{ role: "user", content: opts.user }], fast: opts.fast, provider: opts.provider },
       { signal: call.signal, onDelta: () => undefined },
     );
-    if (result.ok) return { ok: true, text: result.text };
+    if (result.ok) return { ok: true, text: result.text, provider: result.provider };
     if (run.signal.aborted) return { ok: false, error: "Stopped.", kind: "stopped" };
     if (timedOut) return { ok: false, error: `No answer in ${CALL_TIMEOUT_MS / 1000}s.`, kind: "timeout" };
     if (/slow down|limit reached/i.test(result.error)) return { ok: false, error: result.error, kind: "rate" };
@@ -252,6 +252,13 @@ export async function runReview(api: Api, goalInput: string): Promise<void> {
           failures.push(answer);
           patchAgent(api, agent, { state: "silent", note: answer.error.slice(0, 80) });
           return { agent, silent: true, findings: [] as RawFinding[] };
+        }
+        if (answer.provider && answer.provider !== providerOf[agent]) {
+          // The chosen provider failed and /api/chat fell back. Record who really
+          // answered: the tally weighs agreement across different providers.
+          providerOf[agent] = answer.provider;
+          const actual = providers.find((item) => item.id === answer.provider)?.label ?? answer.provider;
+          patchAgent(api, agent, { provider: `${actual} (fallback)` });
         }
         const parsed = parseFindings(agent, answer.text);
         const explicitNone = /NO FINDINGS/i.test(answer.text);

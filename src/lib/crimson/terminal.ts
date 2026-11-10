@@ -8,8 +8,9 @@ export type TermEffect =
   /** owner/name of a public GitHub repository. */
   | { type: "clone"; repo: string }
   | { type: "run"; fileId: string; fileName: string }
-  /** New git state, and file contents to write back (restore / checkout). */
-  | { type: "git"; git: GitState; writes?: { fileId: string; content: string }[] };
+  /** New git state, and file changes to apply (restore, checkout, switch, merge). */
+  | { type: "git"; git: GitState; changes?: Git.FileChange[] }
+  | { type: "push" };
 
 export type TermCtx = {
   cwd: string;
@@ -231,7 +232,9 @@ const GIT_HELP = [
   "git init | status | add <path>|. | commit -m \"msg\"",
   "git log [-n N] | diff [--staged] [path] | show [commit]",
   "git restore [--staged] <path> | checkout <commit> -- <path>",
-  "One branch, history in this browser, no remote (push/pull are not available).",
+  "git branch [-d|-D name | name] | switch [-c] <name> | checkout [-b] <name> | merge <name>",
+  "git remote [-v] | remote add origin owner/name [folder] | remote remove origin | push",
+  "History lives in this browser. Merges are fast-forward only. Pull is not available.",
 ];
 
 /** Turns a terminal path argument into repo paths ("src/main.py"); a folder expands to the files under it. */
@@ -250,8 +253,12 @@ function changeLines(changes: Git.Change[], indent = "  "): string[] {
   return changes.map((change) => `${indent}${change.kind.padEnd(9)}${change.path}`);
 }
 
-function fileIdFor(path: string, ctx: TermCtx): string | undefined {
-  return ctx.files.find((file) => file.type === "file" && Git.pathOf(file, ctx.files) === path)?.id;
+/** A folder argument as a repo path ("" = the project root). */
+function folderPath(arg: string, ctx: TermCtx): string {
+  const segments = resolvePath(ctx.cwd, arg.replace(/\/+$/, ""));
+  if (segments && segments[0] === "project") return segments.slice(1).join("/");
+  if (segments && segments.length === 0) return "";
+  return arg.replace(/^\.\//, "").replace(/^project\/?/, "").replace(/\/+$/, "");
 }
 
 function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffect } {
@@ -351,9 +358,78 @@ function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffe
     return writeBack(repo, repo, paths, index, ctx, "restored from the index");
   }
 
+  if (sub === "branch") {
+    const flag = args[1];
+    const branches = repo.branches ?? {};
+    if (!flag) return { lines: Object.keys(branches).sort().map((name) => `${name === repo.branch ? "*" : " "} ${name}${branches[name] ? `  ${branches[name]}` : "  (no commits)"}`) };
+    if (flag === "-d" || flag === "-D") {
+      const result = Git.deleteBranch(repo, args[2] ?? "", flag === "-D");
+      return typeof result === "string" ? { lines: [`[ERROR] ${result}`] } : { lines: [`[SUCCESS] Deleted branch ${args[2]}`], effect: { type: "git", git: result } };
+    }
+    const result = Git.createBranch(repo, flag);
+    return typeof result === "string" ? { lines: [`[ERROR] ${result}`] } : { lines: [`[SUCCESS] Created branch ${flag} at ${Git.headCommit(repo)?.id ?? "(no commits)"}`], effect: { type: "git", git: result } };
+  }
+
+  if (sub === "switch" || (sub === "checkout" && !args.includes("--"))) {
+    const create = args[1] === "-c" || args[1] === "-b";
+    const name = create ? args[2] : args[1];
+    if (!name) return { lines: [`[ERROR] git ${sub} ${sub === "switch" ? "[-c]" : "[-b]"} <branch>`] };
+    let start = repo;
+    if (create) {
+      const made = Git.createBranch(repo, name);
+      if (typeof made === "string") return { lines: [`[ERROR] ${made}`] };
+      // A new branch starts at the current commit, so no files change.
+      return { lines: [`[SUCCESS] Switched to a new branch '${name}'`], effect: { type: "git", git: { ...made, branch: name } } };
+    }
+    const result = Git.switchBranch(start, work(), name);
+    if (typeof result === "string") return { lines: [`[ERROR] ${result}`] };
+    start = result.git;
+    return { lines: [`[SUCCESS] Switched to branch '${name}'${result.changes.length ? ` (${result.changes.length} file(s) updated)` : ""}`], effect: { type: "git", git: start, changes: result.changes } };
+  }
+
+  if (sub === "merge") {
+    const name = args[1];
+    if (!name) return { lines: ["[ERROR] git merge <branch>"] };
+    const result = Git.mergeBranch(repo, work(), name);
+    if (typeof result === "string") return { lines: [`[ERROR] ${result}`] };
+    return { lines: [`[SUCCESS] ${result.note}${result.changes.length ? ` (${result.changes.length} file(s) updated)` : ""}`], effect: result.changes.length || result.git !== repo ? { type: "git", git: result.git, changes: result.changes } : undefined };
+  }
+
+  if (sub === "remote") {
+    const action = args[1];
+    if (!action || action === "-v") {
+      if (!repo.remote) return { lines: ["[INFO] no remote. git remote add origin owner/name [folder]"] };
+      const track = Object.entries(repo.remote.track).map(([local, remote]) => `${local} → ${remote}`).join(", ");
+      return { lines: [`origin  https://github.com/${repo.remote.repo}  (folder: project/${repo.remote.dir || ""})${track ? `  ${track}` : ""}`] };
+    }
+    if (action === "add") {
+      if (args[2] !== "origin") return { lines: ["[ERROR] git remote add origin owner/name [folder]   (one remote, called origin)"] };
+      if (repo.remote) return { lines: [`[ERROR] origin already points at ${repo.remote.repo}; git remote remove origin first`] };
+      const target = parseRepo(args[3] ?? "");
+      if (!target) return { lines: ["[ERROR] git remote add origin owner/name [folder]"] };
+      const dir = args[4] ? folderPath(args[4], ctx) : "";
+      if (dir && !Object.keys(work()).some((path) => path.startsWith(`${dir}/`))) return { lines: [`[ERROR] project/${dir}/ has no files`] };
+      return {
+        lines: [`[SUCCESS] origin → ${target}, from project/${dir}`, "[INFO] Push sends commits as new history: the GitHub branch must not exist yet (git push creates it). To work on an existing repo, clone it instead."],
+        effect: { type: "git", git: Git.setRemote(repo, target, dir) },
+      };
+    }
+    if (action === "remove" || action === "rm") {
+      if (!repo.remote) return { lines: ["[INFO] no remote to remove"] };
+      return { lines: [`[SUCCESS] removed origin (${repo.remote.repo}); local history is kept`], effect: { type: "git", git: Git.removeRemote(repo) } };
+    }
+    return { lines: ["[ERROR] git remote [-v] | add origin owner/name [folder] | remove origin"] };
+  }
+
+  if (sub === "push") {
+    const plan = Git.pushPlan(repo);
+    if (typeof plan === "string") return { lines: [plan.startsWith("Everything") ? `[INFO] ${plan}` : `[ERROR] ${plan}`] };
+    return { lines: [], effect: { type: "push" } };
+  }
+
   if (sub === "checkout") {
     const dash = args.indexOf("--");
-    if (dash !== 2) return { lines: ["[ERROR] git checkout <commit> -- <path>   (one branch only: switching branches is not available)"] };
+    if (dash !== 2) return { lines: ["[ERROR] git checkout <commit> -- <path>, or git checkout <branch>"] };
     const commit = Git.findCommit(repo, args[1]);
     if (!commit) return { lines: [`[ERROR] unknown commit '${args[1]}'`] };
     if (!commit.tree) return { lines: [`[ERROR] ${commit.id} has no snapshot (made before history was real)`] };
@@ -365,13 +441,13 @@ function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffe
     return writeBack(repo, { ...repo, index }, paths, tree, ctx, `checked out from ${commit.id}`);
   }
 
-  if (sub === "push" || sub === "pull" || sub === "fetch" || sub === "remote" || sub === "branch" || sub === "switch" || sub === "merge") {
-    return { lines: [`[INFO] git ${sub} is not available: history lives in this browser, on one branch, with no remote.`] };
+  if (sub === "pull" || sub === "fetch" || sub === "rebase") {
+    return { lines: [`[INFO] git ${sub} is not available. To pick up changes made on GitHub, clone the repo again.`] };
   }
   return { lines: GIT_HELP };
 }
 
-/** Writes the contents `source` holds for `paths` back into project files that still exist. */
+/** Writes the contents `source` holds for `paths` into the project, recreating files that were deleted. */
 function writeBack(
   repo: GitState,
   next: GitState,
@@ -380,21 +456,19 @@ function writeBack(
   ctx: TermCtx,
   verb: string,
 ): { lines: string[]; effect?: TermEffect } {
-  const writes: { fileId: string; content: string }[] = [];
+  const changes: Git.FileChange[] = [];
   const lines: string[] = [];
+  const existing = new Set(ctx.files.filter((file) => file.type === "file").map((file) => Git.pathOf(file, ctx.files)));
+  let recreated = 0;
   for (const path of paths) {
     const content = Git.blob(repo, source[path]);
     if (content === undefined) {
       lines.push(`[ERROR] ${path} is not in that version`);
       continue;
     }
-    const fileId = fileIdFor(path, ctx);
-    if (!fileId) {
-      lines.push(`[ERROR] ${path} no longer exists in the project; create an empty file there first, then restore`);
-      continue;
-    }
-    writes.push({ fileId, content });
+    if (!existing.has(path)) recreated++;
+    changes.push({ path, content });
   }
-  if (writes.length) lines.unshift(`[SUCCESS] ${writes.length} file(s) ${verb}`);
-  return { lines, effect: writes.length || next !== repo ? { type: "git", git: next, writes } : undefined };
+  if (changes.length) lines.unshift(`[SUCCESS] ${changes.length} file(s) ${verb}${recreated ? ` (${recreated} recreated)` : ""}`);
+  return { lines, effect: changes.length || next !== repo ? { type: "git", git: next, changes } : undefined };
 }
