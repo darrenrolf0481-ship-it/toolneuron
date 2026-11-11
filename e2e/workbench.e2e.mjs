@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { chromium } from "playwright";
+import { readGitDb } from "./helpers.mjs";
 
 const BASE_URL = process.env.BASE_URL ?? "http://localhost:8095";
 let browser;
@@ -90,8 +91,11 @@ describe("terminal git", () => {
     out = await app.term("git pull");
     assert.match(out, /no remote to pull from/);
     const state = await app.saved();
-    assert.equal(state.git.commits[0].message, "start");
-    assert.ok(Object.keys(state.git.commits[0].tree).includes("src/neural_brain.py"));
+    assert.equal(state.git, undefined, "git history is not in localStorage any more");
+    assert.equal(state.gitInIndexedDb, true);
+    const { meta } = await readGitDb(app.page);
+    assert.equal(meta.commits[0].message, "start");
+    assert.ok(Object.keys(meta.commits[0].tree).includes("src/neural_brain.py"));
     assert.ok(!state.files.find((f) => f.name === "neural_brain.py").content.startsWith("# e2e edit"), "restore wrote the file back");
     assert.deepEqual(app.errors, []);
     await app.close();

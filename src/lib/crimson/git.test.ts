@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { abortMerge, blob, add, untrackedCollisions, commitFiles, historyComplete, localIdOf, pullSnapshot, treeParentOf, applyChanges, collect, commit, createBranch, diffText, EMPTY_GIT, findCommit, hash, history, init, markPushed, MAX_COMMITS, merge3, mergeBlockers, mergeBranch, mergeTrees, normalizeGit, pathOf, pushPlan, setRemote, status, subtree, switchBranch, unstage, workingFiles } from "./git.ts";
+import { abortMerge, blob, add, untrackedCollisions, commitFiles, historyComplete, localIdOf, pullSnapshot, treeParentOf, applyChanges, collect, commit, createBranch, diffText, EMPTY_GIT, findCommit, hash, history, init, markPushed, merge3, mergeBlockers, mergeBranch, mergeTrees, normalizeGit, pathOf, pushPlan, setRemote, status, subtree, switchBranch, unstage, workingFiles } from "./git.ts";
 import type { ProjectFile } from "./types.ts";
 
 const files: ProjectFile[] = [
@@ -58,18 +58,23 @@ describe("add, commit, status", () => {
 });
 
 describe("history", () => {
-  it("finds commits by HEAD~n and prefix, keeps MAX_COMMITS, and drops unused blobs", () => {
+  it("finds commits by HEAD~n and prefix, keeps all reachable history, and drops unused blobs", () => {
     let git = init(EMPTY_GIT);
-    for (let i = 0; i < MAX_COMMITS + 5; i++) {
+    for (let i = 0; i < 60; i++) {
       git = commit(add(git, { "f.txt": `v${i}\n` }, ["."]).git, `c${i}`, `t${i}`)!;
     }
-    assert.equal(git.commits.length, MAX_COMMITS);
-    assert.equal(findCommit(git, "HEAD")?.message, `c${MAX_COMMITS + 4}`);
-    assert.equal(findCommit(git, "HEAD~1")?.message, `c${MAX_COMMITS + 3}`);
+    assert.equal(git.commits.length, 60, "no fixed cap any more");
+    assert.equal(findCommit(git, "HEAD")?.message, "c59");
+    assert.equal(findCommit(git, "HEAD~1")?.message, "c58");
     assert.equal(findCommit(git, git.commits[3].id.slice(0, 5))?.message, git.commits[3].message);
     assert.equal(findCommit(git, "abc"), undefined, "too short");
-    assert.equal(Object.keys(git.blobs!).length, MAX_COMMITS, "one blob per surviving version");
-    assert.equal(Object.keys(collect(git).blobs!).length, MAX_COMMITS);
+    assert.equal(Object.keys(git.blobs!).length, 60, "one blob per version");
+    // A branch nobody can reach any more is dropped with its blobs.
+    const side = commit(add({ ...(createBranch(git, "side") as typeof git), branch: "side" }, { "f.txt": "side only" }, ["."]).git, "side", "ts")!;
+    const gone = commit(add({ ...side, branch: "main", branches: { main: side.branches!.main } }, { "f.txt": "v60\n" }, ["."]).git, "c60", "t60")!;
+    assert.equal(gone.commits.some((c) => c.message === "side"), false);
+    assert.equal(Object.values(gone.blobs!).includes("side only"), false);
+    assert.equal(Object.keys(collect(gone).blobs!).length, 61);
   });
   it("normalizeGit upgrades old saves without inventing history", () => {
     const old = normalizeGit({ initialized: true, branch: "main", staged: ["a"], commits: [{ id: "abc1234", message: "old", time: "t" }] });
@@ -314,13 +319,26 @@ describe("pull snapshot and merge-commit pushes (E1)", () => {
 });
 
 describe("history safety", () => {
-  it("a missing merge base is an error, never an empty base (E5b)", () => {
+  it("long histories stay complete, so an old branch merges correctly (E5b)", () => {
     let g = commit(add(init(EMPTY_GIT), { "a.txt": "keep", "b.txt": "b0" }, ["."]).git, "A", "t0")!;
     g = createBranch(g, "feature") as typeof g;
     g = commit(add(g, { "b.txt": "b0" }, ["."]).git, "delete a", "t1")!;
     for (let i = 0; i < 55; i++) g = commit(add(g, { "b.txt": `b${i + 1}` }, ["."]).git, `m${i}`, `t${i + 2}`)!;
-    assert.equal(historyComplete(g, g.branches!.main), false);
-    assert.match(mergeBranch(g, { "b.txt": "b55" }, "feature", "t99") as string, /no longer stored/);
+    assert.equal(historyComplete(g, g.branches!.main), true);
+    const merged = mergeBranch(g, { "b.txt": "b55" }, "feature", "t99");
+    assert.ok(typeof merged !== "string");
+    assert.equal(merged.note, "Already up to date.", "feature is an ancestor: nothing comes back");
+  });
+  it("a missing merge base is an error, never an empty base", () => {
+    let g = commit(add(init(EMPTY_GIT), { "a.txt": "keep" }, ["."]).git, "A", "t0")!;
+    g = createBranch(g, "feature") as typeof g;
+    g = commit(add({ ...g, branch: "feature" }, { "a.txt": "keep", "f.txt": "f" }, ["."]).git, "F", "t1")!;
+    g = { ...g, branch: "main" };
+    g = commit(add(g, { "b.txt": "b" }, ["."]).git, "B", "t2")!;
+    // Lose the common ancestor A (as old saves that were trimmed did).
+    const broken = { ...g, commits: g.commits.filter((c) => c.message !== "A") };
+    assert.equal(historyComplete(broken, broken.branches!.main), false);
+    assert.match(mergeBranch(broken, { "b.txt": "b" }, "feature", "t3") as string, /no longer stored/);
   });
   it("trim keeps the commit GitHub's branch was last seen at", () => {
     let g = linked({ "r/a.txt": "0" });

@@ -64,7 +64,9 @@ that shaped the work, plus the design notes for the swarm and the skills.
 - **Vault.** Encrypted notes: AES-256-GCM, key wrapped by a passphrase
   (PBKDF2, 600k rounds) and optionally a passkey (WebAuthn PRF).
 
-Files, chat and settings stay in the browser (localStorage). Only chat,
+Files, chat and settings stay in the browser (localStorage); git history
+(commits and every file version) is kept in the browser's IndexedDB, with
+no commit limit. Only chat,
 review and the terminal's `ai` command call the AI, and only when you send.
 
 ## Run it

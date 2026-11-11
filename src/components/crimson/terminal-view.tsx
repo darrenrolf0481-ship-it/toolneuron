@@ -32,6 +32,10 @@ export function TerminalView() {
     push([`${cwd} $ ${cmd}`]);
     // The open draft is newer than its saved file; git and cat should see it.
     const now = useOs.getState();
+    if (now.gitStorage === "loading" && /^(git|gh)\b/.test(cmd)) {
+      push(["[WARN] Git history is still loading from browser storage; try again in a moment."]);
+      return;
+    }
     const result = interpret(cmd, { cwd, files: now.files, git: now.git, live: now.activeFileId ? { id: now.activeFileId, content: now.draft } : undefined });
     if (result.effect?.type === "clear") {
       clear();

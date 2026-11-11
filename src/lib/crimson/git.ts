@@ -16,7 +16,6 @@ import type { GitCommit as Commit, GitMerging as Merging, GitRemote as Remote, G
 
 export type { Commit, GitState, Merging, Remote, Tree };
 
-export const MAX_COMMITS = 50;
 /** Larger files are diffed as "changed" instead of line by line. */
 const DIFF_CELL_LIMIT = 2_000_000;
 const DIFF_MAX_LINES = 400;
@@ -276,17 +275,26 @@ export function commitFiles(git: GitState, files: Record<string, string>, messag
   return trim({ ...git, blobs, index: { ...(git.index ?? {}), ...added }, branches: { ...(git.branches ?? {}), [git.branch]: id }, commits: [made, ...git.commits] });
 }
 
-/** Keeps the newest MAX_COMMITS commits plus every branch head, then drops unused blobs. */
+/**
+ * Drops only commits nothing can reach (from a branch, a merge in progress,
+ * or a commit GitHub's branches were last seen at), then the blobs nothing
+ * refers to. Reachable history is never dropped: an incomplete history
+ * makes merges and pushes wrong (see historyComplete). History lives in
+ * IndexedDB (git-store.ts), so there is no fixed commit cap.
+ */
 function trim(git: GitState): GitState {
-  const heads = new Set(Object.values(git.branches ?? {}).filter((id): id is string => Boolean(id)));
-  if (git.merging) heads.add(git.merging.theirs);
-  // Keep the commits GitHub's branches were last seen at: push and pull start from them.
+  const roots = new Set(Object.values(git.branches ?? {}).filter((id): id is string => Boolean(id)));
+  if (git.merging) roots.add(git.merging.theirs);
   for (const sha of Object.values(git.remote?.tips ?? {})) {
     const id = Object.entries(git.remote?.shas ?? {}).find(([, known]) => known === sha)?.[0];
-    if (id) heads.add(id);
+    if (id) roots.add(id);
   }
-  const commits = git.commits.filter((commit, index) => index < MAX_COMMITS || heads.has(commit.id));
-  return collect({ ...git, commits });
+  const keep = new Set<string>();
+  for (const root of roots) for (const commit of history(git, root)) keep.add(commit.id);
+  const commits = git.commits.filter((commit) => keep.has(commit.id));
+  // Forget GitHub shas of commits that are gone.
+  const remote = git.remote ? { ...git.remote, shas: Object.fromEntries(Object.entries(git.remote.shas).filter(([id]) => keep.has(id))) } : undefined;
+  return collect({ ...git, commits, ...(remote ? { remote } : {}) });
 }
 
 /** Drops blobs nothing refers to any more (after old commits fall off the end). */

@@ -19,10 +19,15 @@ export function GitPanel() {
   const [message, setMessage] = useState("");
   const [open, setOpen] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
+  const storage = useOs((state) => state.gitStorage);
 
   const git = useMemo(() => Git.normalizeGit(raw), [raw]);
   const work = useMemo(() => Git.workingFiles(files, activeFileId ? { id: activeFileId, content: draft } : undefined), [files, activeFileId, draft]);
   const state = useMemo(() => Git.status(git, work), [git, work]);
+
+  if (storage === "loading") {
+    return <p className="p-4 text-sm text-muted">Loading git history from browser storage…</p>;
+  }
 
   if (!git.initialized) {
     return (

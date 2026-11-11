@@ -15,7 +15,7 @@ import { parseRepo } from "@/lib/crimson/terminal";
  * bootstrapEmpty). Needs GITHUB_TOKEN; same access checks as chat.
  */
 const MAX_BODY_BYTES = 6 * 1024 * 1024;
-const MAX_COMMITS = 50;
+const MAX_COMMITS = 200;
 
 type Change = { path: string; content: string | null };
 type Parent = { sha: string } | { index: number };
