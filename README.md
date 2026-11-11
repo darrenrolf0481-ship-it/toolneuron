@@ -71,7 +71,7 @@ review and the terminal's `ai` command call the AI, and only when you send.
 
 ## Run it
 
-Node 22 or newer.
+Node 22.12 or newer.
 
 ```sh
 npm install
@@ -88,6 +88,25 @@ addresses.
 The AI stays locked until you enter `APP_ACCESS_KEY` (header lock button).
 Requests are rate limited (`AI_RATE_PER_MIN`, `AI_DAILY_CAP`) and must come
 from the same site.
+
+## Who it is for
+
+ToolNeuron is built for **one person on their own server**. Its protections
+assume that:
+
+- `APP_ACCESS_KEY` is a single shared key. Anyone who has it can use the AI
+  and the GitHub features; there are no user accounts and no per-user data.
+- `GITHUB_TOKEN` is one server-wide token. Everyone with the access key acts
+  as that GitHub user on the repos in `GITHUB_REPOS`. Keep that list short and
+  the token as narrow as you can (fine-grained, only those repos).
+- Files, chat and git history live in each browser, not on the server, so two
+  browsers do not see each other's work.
+- Keep the server on `127.0.0.1` and reach it through an SSH tunnel (see Run
+  it), or behind your own HTTPS reverse proxy with `TRUST_PROXY=true`.
+
+It is **not** a multi-user service. Sharing it with other people would need
+per-user sign-in and each user's own GitHub authorization, which it does not
+have.
 
 ## Providers and models
 
@@ -137,13 +156,22 @@ The browser tests fake the AI by answering `/api/chat` inside the page, so
 they need no key and cost nothing. They check what the app sends (system
 prompt, history, handoff note, files) and how it shows replies. They do not
 check what a real model says. `BASE_URL` overrides the default
-`http://localhost:8095`.
+`http://localhost:8095`. The tests wait for the app to mark itself ready
+(`data-ready` on the page root) rather than for the network to go quiet.
+
+CI (`.github/workflows/ci.yml`) runs typecheck, lint, `npm test`, the build
+and the browser tests on every push to `main` and every pull request. It
+needs no secrets.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `src/lib/crimson/store.ts` | App state (zustand): chat, files, swarm, terminal, saving |
+| `src/lib/crimson/store.ts` | App state (zustand): files, modes, packs, swarm hooks, reset |
+| `src/lib/crimson/store-git.ts` | Git and GitHub actions: commit, clone, push, pull |
+| `src/lib/crimson/store-chat.ts` | Chat, handoff and the terminal's `ai` |
+| `src/lib/crimson/store-persist.ts` | Saving (localStorage, IndexedDB via `git-store.ts`), export / import |
+| `src/lib/crimson/store-shared.ts` | The fresh workspace and in-flight work a reset cancels |
 | `src/lib/crimson/prompt.ts` | What the AI is sent: system prompts, history, save upgrades (pure, tested) |
 | `src/lib/crimson/handoff.ts` | Handoff note format, pinning, history labels (pure, tested) |
 | `src/lib/crimson/skills/catalog.ts` | The 38 skill cards and which modes use them |

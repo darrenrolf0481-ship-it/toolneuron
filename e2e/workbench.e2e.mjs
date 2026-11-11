@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { chromium } from "playwright";
-import { readGitDb } from "./helpers.mjs";
+import { gotoApp, readGitDb } from "./helpers.mjs";
 
 const BASE_URL = process.env.BASE_URL ?? "http://localhost:8095";
 let browser;
@@ -46,7 +46,7 @@ async function openApp({ clone, push, fetch: fetchReply } = {}) {
     sessionStorage.setItem("e2e-seeded", "1");
     localStorage.clear();
   });
-  await page.goto(BASE_URL, { waitUntil: "networkidle" });
+  await gotoApp(page, BASE_URL);
   await page.waitForTimeout(500);
   const term = async (command) => {
     const box = page.getByLabel("Terminal command");

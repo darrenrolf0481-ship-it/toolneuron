@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # The browser tests fake the AI and GitHub inside the page: no keys or secrets needed.
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Start the app
+        run: |
+          npm run dev:vm > dev.log 2>&1 &
+          for i in $(seq 1 90); do
+            curl -fsS -o /dev/null http://127.0.0.1:8095/ && exit 0
+            sleep 2
+          done
+          echo "The app did not start:"; cat dev.log; exit 1
+
+      - name: Browser tests
+        run: npm run test:e2e
+        env:
+          BASE_URL: http://127.0.0.1:8095
+
+      - name: Server log
+        if: failure()
+        run: cat dev.log

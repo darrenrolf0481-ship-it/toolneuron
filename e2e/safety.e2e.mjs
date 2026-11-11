@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { chromium } from "playwright";
+import { gotoApp, reloadApp } from "./helpers.mjs";
 
 const BASE_URL = process.env.BASE_URL ?? "http://localhost:8095";
 let browser;
@@ -18,7 +19,7 @@ after(async () => {
 
 async function fresh(context) {
   const page = await context.newPage();
-  await page.goto(BASE_URL, { waitUntil: "networkidle" });
+  await gotoApp(page, BASE_URL);
   await page.waitForTimeout(600);
   return page;
 }
@@ -28,7 +29,7 @@ describe("file names", () => {
     const context = await browser.newContext({ viewport: { width: 1280, height: 844 } });
     const page = await fresh(context);
     await page.evaluate(() => localStorage.clear());
-    await page.reload({ waitUntil: "networkidle" });
+    await reloadApp(page);
     await page.getByRole("button", { name: "Edit" }).first().click();
     await page.getByRole("button", { name: "New file" }).first().click();
     const input = page.getByLabel("New file name");
@@ -51,7 +52,7 @@ describe("two tabs", () => {
     const context = await browser.newContext({ viewport: { width: 1280, height: 844 } });
     const a = await fresh(context);
     await a.evaluate(() => localStorage.clear());
-    await a.reload({ waitUntil: "networkidle" });
+    await reloadApp(a);
     await a.waitForTimeout(600);
     const b = await fresh(context);
     // Tab B changes the project (switch to the terminal, run a command) and saves.
@@ -84,9 +85,9 @@ describe("chat stream", () => {
       // A delta, then the connection ends: no "done" event.
       route.fulfill({ status: 200, contentType: "application/x-ndjson", body: `${JSON.stringify({ t: "delta", v: "Half an ans" })}\n` }),
     );
-    await page.goto(BASE_URL, { waitUntil: "networkidle" });
+    await gotoApp(page, BASE_URL);
     await page.evaluate(() => localStorage.clear());
-    await page.reload({ waitUntil: "networkidle" });
+    await reloadApp(page);
     await page.waitForTimeout(500);
     await page.getByRole("button", { name: "Hub" }).first().click();
     await page.getByRole("button", { name: /^Chat$/ }).first().click();

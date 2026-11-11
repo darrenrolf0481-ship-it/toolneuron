@@ -1,8 +1,11 @@
 {
-  "name": "app-builder-workspace",
+  "name": "toolneuron",
   "private": true,
   "sideEffects": false,
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "overrides": {
     "nf3": "0.3.17"
   },

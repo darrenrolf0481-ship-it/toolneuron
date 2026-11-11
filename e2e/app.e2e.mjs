@@ -12,6 +12,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { chromium } from "playwright";
+import { gotoApp } from "./helpers.mjs";
 
 const BASE_URL = process.env.BASE_URL ?? "http://localhost:8095";
 const OLD_WELCOME =
@@ -52,7 +53,7 @@ async function openApp({ save = null, replies = [], width = 1280 } = {}) {
     localStorage.clear();
     if (initial) localStorage.setItem("crimson_os_v1", JSON.stringify(initial));
   }, save);
-  await page.goto(BASE_URL, { waitUntil: "networkidle" });
+  await gotoApp(page, BASE_URL);
   await page.waitForTimeout(600);
   const app = {
     page,

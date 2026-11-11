@@ -17,3 +17,22 @@ export function readGitDb(page) {
       }),
   );
 }
+
+/**
+ * Opens the app and waits until it has loaded its save and git history.
+ * (Not "networkidle": background requests can keep the network busy forever.)
+ */
+export async function gotoApp(page, url) {
+  await page.goto(url, { waitUntil: "domcontentloaded" });
+  await waitReady(page);
+}
+
+/** Reloads the page and waits for the app to be ready again. */
+export async function reloadApp(page) {
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await waitReady(page);
+}
+
+function waitReady(page) {
+  return page.locator('[data-ready="true"]').waitFor({ state: "attached", timeout: 30_000 });
+}

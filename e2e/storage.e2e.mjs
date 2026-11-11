@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { chromium } from "playwright";
-import { readGitDb } from "./helpers.mjs";
+import { gotoApp, readGitDb, reloadApp } from "./helpers.mjs";
 
 const BASE_URL = process.env.BASE_URL ?? "http://localhost:8095";
 let browser;
@@ -28,7 +28,7 @@ async function open(seed) {
     localStorage.clear();
     if (initial) localStorage.setItem("crimson_os_v1", JSON.stringify(initial));
   }, seed ?? null);
-  await page.goto(BASE_URL, { waitUntil: "networkidle" });
+  await gotoApp(page, BASE_URL);
   await page.waitForTimeout(600);
   const term = async (command) => {
     const box = page.getByLabel("Terminal command");
@@ -74,7 +74,7 @@ describe("git history storage", () => {
     const db = await readGitDb(app.page);
     assert.deepEqual(db.meta.commits.map((c) => c.message), ["second (old save)", "first (old save)"]);
     assert.equal(db.blobs, 2);
-    await app.page.reload({ waitUntil: "networkidle" });
+    await reloadApp(app.page);
     await app.page.waitForTimeout(600);
     await app.page.getByRole("button", { name: "Term" }).first().click();
     await app.term("git log");
@@ -106,7 +106,7 @@ describe("git history storage", () => {
     const db = await readGitDb(app.page);
     assert.equal(db.meta.commits.length, N);
     assert.ok(JSON.stringify(state).length < 60_000, `localStorage holds ${JSON.stringify(state).length} chars`);
-    await app.page.reload({ waitUntil: "networkidle" });
+    await reloadApp(app.page);
     await app.page.waitForTimeout(600);
     await app.page.getByRole("button", { name: "Term" }).first().click();
     await app.term("git log -n 100");
@@ -123,7 +123,7 @@ describe("git history storage", () => {
     await app.term("git add .");
     await app.term('git commit -m "just before reload"');
     // No waiting for the debounce or the IndexedDB write.
-    await app.page.reload({ waitUntil: "networkidle" });
+    await reloadApp(app.page);
     await app.page.waitForTimeout(800);
     await app.page.getByRole("button", { name: "Term" }).first().click();
     await app.term("git log");

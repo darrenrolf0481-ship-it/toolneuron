@@ -33,6 +33,8 @@ export function CrimsonOS() {
   const tab = useOs((state) => state.tab);
   const theme = useOs((state) => state.theme);
   const setTab = useOs((state) => state.setTab);
+  // Set once the saved workspace and git history are loaded (the browser tests wait for it).
+  const ready = useOs((state) => state.booted && state.gitStorage !== "loading");
 
   useEffect(() => {
     bootPersistence();
@@ -43,7 +45,7 @@ export function CrimsonOS() {
   }, [theme]);
 
   return (
-    <div className="flex h-dvh overflow-hidden bg-bg text-fg">
+    <div className="flex h-dvh overflow-hidden bg-bg text-fg" data-ready={ready ? "true" : undefined}>
       <nav className="hidden w-20 shrink-0 flex-col items-center gap-3 border-r border-border bg-surface py-5 md:flex">
         <div className="mb-3 flex h-11 w-11 items-center justify-center rounded-2xl bg-primary text-on-primary">
           <Cpu className="h-5 w-5" />
