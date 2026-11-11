@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { add, applyChanges, collect, commit, createBranch, diffText, EMPTY_GIT, findCommit, hash, history, init, markPushed, MAX_COMMITS, mergeBranch, normalizeGit, pathOf, pushPlan, setRemote, status, subtree, switchBranch, unstage, workingFiles } from "./git.ts";
+import { abortMerge, add, applyChanges, collect, commit, createBranch, diffText, EMPTY_GIT, findCommit, hash, history, init, markPushed, MAX_COMMITS, merge3, mergeBlockers, mergeBranch, mergeTrees, newestOnGitHub, normalizeGit, pathOf, pushPlan, replayRemote, setRemote, status, subtree, switchBranch, unstage, workingFiles } from "./git.ts";
 import type { ProjectFile } from "./types.ts";
 
 const files: ProjectFile[] = [
@@ -116,11 +116,9 @@ describe("branches", () => {
     const back = switchBranch(ahead, { "a.txt": "2", "b.txt": "new" }, "main");
     assert.ok(typeof back !== "string");
     assert.deepEqual(back.changes, [{ path: "a.txt", content: "1" }, { path: "b.txt", content: null }]);
-    const merged = mergeBranch(back.git, { "a.txt": "1" }, "topic");
+    const merged = mergeBranch(back.git, { "a.txt": "1" }, "topic", "t2");
     assert.ok(typeof merged !== "string");
-    assert.equal(merged.git.branches!.main, merged.git.branches!.topic);
-    const diverged = commit(add(back.git, { "a.txt": "3" }, ["."]).git, "main work", "t2")!;
-    assert.match(mergeBranch(diverged, { "a.txt": "3" }, "topic") as string, /diverged/);
+    assert.equal(merged.git.branches!.main, merged.git.branches!.topic, "fast-forward");
   });
   it("old saves get one branch at the newest commit", () => {
     const old = normalizeGit({ initialized: true, branch: "main", commits: [{ id: "abc1234", message: "m", time: "t", tree: {} }] });
@@ -138,7 +136,9 @@ describe("push plan", () => {
     git = commit(add(git, { "site/about.html": "a", "notes.txt": "y" }, ["."]).git, "about, remove index", "t2")!;
     const plan = pushPlan(git);
     assert.ok(typeof plan !== "string");
-    assert.equal(plan.parentSha, sha(1));
+    assert.equal(plan.expectSha, sha(1));
+    assert.deepEqual(plan.commits[0].parents, [{ sha: sha(1) }]);
+    assert.deepEqual(plan.commits[1].parents, [{ index: 0 }]);
     assert.deepEqual(plan.commits.map((c) => [c.message, c.changes]), [
       ["edit", [{ path: "index.html", content: "v2" }]],
       ["about, remove index", [{ path: "about.html", content: "a" }, { path: "index.html", content: null }]],
@@ -154,7 +154,7 @@ describe("push plan", () => {
     const plan = pushPlan(git);
     assert.ok(typeof plan !== "string");
     assert.equal(plan.branch, "fix");
-    assert.equal(plan.parentSha, sha(4));
+    assert.equal(plan.expectSha, sha(4));
     assert.equal(plan.commits.length, 1);
   });
   it("needs a remote and a commit", () => {
@@ -179,5 +179,104 @@ describe("applyChanges", () => {
     const intro = out.find((f) => f.name === "intro.md")!;
     assert.equal(pathOf(intro, out), "docs/guide/intro.md");
     assert.equal(intro.language, "markdown");
+  });
+});
+
+describe("merge3", () => {
+  const base = "a\nb\nc\nd\ne";
+  it("applies changes to different lines from both sides", () => {
+    assert.deepEqual(merge3(base, "A\nb\nc\nd\ne", "a\nb\nc\nd\nE"), { text: "A\nb\nc\nd\nE", conflict: false });
+    assert.deepEqual(merge3(base, "a\nb\nX\nc\nd\ne", "a\nb\nc\nd\ne\nf"), { text: "a\nb\nX\nc\nd\ne\nf", conflict: false });
+  });
+  it("takes identical changes once, and one-sided changes whole", () => {
+    assert.equal(merge3(base, "a\nB\nc\nd\ne", "a\nB\nc\nd\ne").text, "a\nB\nc\nd\ne");
+    assert.equal(merge3(base, base, "z").text, "z");
+  });
+  it("marks overlapping different changes as a conflict", () => {
+    const out = merge3(base, "a\nOURS\nc\nd\ne", "a\nTHEIRS\nc\nd\ne");
+    assert.equal(out.conflict, true);
+    assert.equal(out.text, "a\n<<<<<<< ours\nOURS\n=======\nTHEIRS\n>>>>>>> theirs\nc\nd\ne");
+  });
+  it("both adding a file with different contents conflicts", () => {
+    assert.equal(merge3(undefined, "x", "y").conflict, true);
+  });
+});
+
+describe("three-way merge of branches", () => {
+  const start = commit(add(init(EMPTY_GIT), { "a.txt": "1\n2\n3", "b.txt": "b" }, ["."]).git, "base", "t0")!;
+  const topic = { ...(createBranch(start, "topic") as typeof start), branch: "topic" };
+  const theirs = commit(add(topic, { "a.txt": "1\n2\nTHREE", "b.txt": "b", "c.txt": "new" }, ["."]).git, "topic work", "t1")!;
+  const back = switchBranch(theirs, { "a.txt": "1\n2\nTHREE", "b.txt": "b", "c.txt": "new" }, "main") as { git: typeof start };
+
+  it("clean: makes a merge commit with both parents", () => {
+    const ours = commit(add(back.git, { "a.txt": "ONE\n2\n3", "b.txt": "b" }, ["."]).git, "main work", "t2")!;
+    const merged = mergeBranch(ours, { "a.txt": "ONE\n2\n3", "b.txt": "b" }, "topic", "t3");
+    assert.ok(typeof merged !== "string");
+    assert.deepEqual(merged.conflicts, []);
+    const made = merged.git.commits[0];
+    assert.equal(made.parent, ours.branches!.main);
+    assert.equal(made.parent2, ours.branches!.topic);
+    assert.deepEqual(merged.changes, [{ path: "a.txt", content: "ONE\n2\nTHREE" }, { path: "c.txt", content: "new" }]);
+    assert.equal(history(merged.git).length, 4, "log reaches both sides");
+    assert.equal(findCommit(merged.git, "HEAD~1")?.message, "main work", "~ follows the first parent");
+  });
+
+  it("conflict: merge in progress until fixed, staged and committed; abort puts files back", () => {
+    const ours = commit(add(back.git, { "a.txt": "1\n2\nthree!", "b.txt": "b" }, ["."]).git, "main work", "t2")!;
+    const merged = mergeBranch(ours, { "a.txt": "1\n2\nthree!", "b.txt": "b" }, "topic", "t3");
+    assert.ok(typeof merged !== "string");
+    assert.deepEqual(merged.conflicts, ["a.txt"]);
+    const work = { "a.txt": merged.changes.find((c) => c.path === "a.txt")!.content!, "b.txt": "b", "c.txt": "new" };
+    assert.match(work["a.txt"], /<<<<<<< ours\nthree!\n=======\nTHREE\n>>>>>>> theirs/);
+    assert.deepEqual(mergeBlockers(merged.git), ["a.txt: still conflicted (fix it, then git add a.txt)"]);
+    assert.match(pushPlan(setRemote(merged.git, "me/r", "")) as string, /merge is in progress/);
+    assert.match(switchBranch(merged.git, work, "topic") as string, /merge is in progress/);
+    // Staging the markers is caught too.
+    const markers = add(merged.git, work, ["a.txt"]).git;
+    assert.match(mergeBlockers(markers)[0], /still has conflict markers/);
+    const fixed = add(merged.git, { ...work, "a.txt": "1\n2\nTHREE!" }, ["a.txt", "c.txt"]).git;
+    assert.deepEqual(mergeBlockers(fixed), []);
+    const done = commit(fixed, merged.git.merging!.message, "t4")!;
+    assert.equal(done.merging, undefined);
+    assert.equal(done.commits[0].parent2, ours.branches!.topic);
+    const aborted = abortMerge(merged.git);
+    assert.ok(typeof aborted !== "string");
+    assert.deepEqual(aborted.changes, [{ path: "a.txt", content: "1\n2\nthree!" }, { path: "c.txt", content: null }]);
+    assert.equal(aborted.git.merging, undefined);
+  });
+
+  it("delete on one side, edit on the other is a conflict that keeps the edit", () => {
+    const g = init(EMPTY_GIT);
+    const blobs = { [hash("x")]: "x", [hash("y")]: "y" };
+    const out = mergeTrees({ ...g, blobs }, { "f.txt": hash("x") }, {}, { "f.txt": hash("y") });
+    assert.deepEqual(out.conflicts, ["f.txt"]);
+    assert.match(out.changes[0].content!, /CONFLICT: deleted here, changed on the other side[\s\S]*\ny$/);
+  });
+});
+
+describe("push plan with merges, and pull replay", () => {
+  const sha = (c: string) => c.repeat(40);
+  it("a merge commit after a pull pushes with both parents and expects the pulled head", () => {
+    let git = commit(add(init(EMPTY_GIT), { "r/a.txt": "1\n2\n3" }, ["."]).git, "clone", "t0")!;
+    git = setRemote(git, "me/r", "r", { main: "main" }, { [git.branches!.main!]: sha("a") });
+    git = commit(add(git, { "r/a.txt": "ONE\n2\n3" }, ["."]).git, "local", "t1")!;
+    const replayed = replayRemote(git, sha("a"), [{ sha: sha("b"), message: "on github", changes: [{ path: "a.txt", content: "1\n2\nTHREE" }, { path: "new.txt", content: "n" }] }], "t2");
+    assert.ok(typeof replayed !== "string");
+    const tip = replayed.git.commits.find((c) => c.id === replayed.tip)!;
+    assert.deepEqual(Object.keys(tip.tree!).sort(), ["r/a.txt", "r/new.txt"], "remote paths land under the folder");
+    const merged = mergeBranch({ ...replayed.git, branches: { ...replayed.git.branches, upstream: replayed.tip } }, { "r/a.txt": "ONE\n2\n3" }, "upstream", "t3");
+    assert.ok(typeof merged !== "string" && merged.conflicts.length === 0);
+    assert.equal(newestOnGitHub(merged.git)?.id, replayed.tip);
+    const plan = pushPlan(merged.git);
+    assert.ok(typeof plan !== "string");
+    assert.equal(plan.expectSha, sha("b"));
+    assert.deepEqual(plan.commits.map((c) => c.message), ["local", merged.git.commits[0].message]);
+    assert.deepEqual(plan.commits[0].parents, [{ sha: sha("a") }]);
+    assert.deepEqual(plan.commits[1].parents, [{ index: 0 }, { sha: sha("b") }]);
+    assert.deepEqual(plan.commits[1].changes, [{ path: "a.txt", content: "ONE\n2\nTHREE" }, { path: "new.txt", content: "n" }]);
+  });
+  it("replay refuses an unknown base", () => {
+    const git = setRemote(init(EMPTY_GIT), "me/r", "");
+    assert.match(replayRemote(git, sha("c"), [], "t") as string, /no longer in local history/);
   });
 });

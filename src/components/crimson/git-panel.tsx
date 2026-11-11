@@ -13,6 +13,7 @@ export function GitPanel() {
   const gitCommit = useOs((state) => state.gitCommit);
   const applyGit = useOs((state) => state.applyGit);
   const gitPush = useOs((state) => state.gitPush);
+  const gitPull = useOs((state) => state.gitPull);
   const [branchName, setBranchName] = useState("");
   const [pushing, setPushing] = useState(false);
   const [message, setMessage] = useState("");
@@ -113,19 +114,72 @@ export function GitPanel() {
         {git.remote ? `Pushes project/${git.remote.dir ? `${git.remote.dir}/` : ""} to ${git.remote.repo}.` : "No remote: clone a repo with GITHUB_TOKEN set, or git remote add origin owner/name in the terminal."}
       </p>
       {git.remote && (
-        <button
-          type="button"
-          disabled={pushing || toPush === 0}
-          onClick={async () => {
-            setPushing(true);
-            const result = await gitPush();
-            setPushing(false);
-            setNotice(result.message);
-          }}
-          className="min-h-11 rounded-2xl bg-primary px-4 text-sm font-semibold text-on-primary disabled:opacity-40"
-        >
-          {pushing ? "Pushing…" : toPush ? `Push ${toPush} commit(s) to ${git.remote.repo}` : "Nothing to push"}
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            disabled={pushing || Boolean(git.merging)}
+            onClick={async () => {
+              setPushing(true);
+              const result = await gitPull();
+              setPushing(false);
+              setNotice(result.message);
+            }}
+            className="min-h-11 rounded-2xl border border-border px-4 text-sm disabled:opacity-40"
+          >
+            Pull from {git.remote.repo}
+          </button>
+          <button
+            type="button"
+            disabled={pushing || toPush === 0 || Boolean(git.merging)}
+            onClick={async () => {
+              setPushing(true);
+              const result = await gitPush();
+              setPushing(false);
+              setNotice(result.message);
+            }}
+            className="min-h-11 rounded-2xl bg-primary px-4 text-sm font-semibold text-on-primary disabled:opacity-40"
+          >
+            {pushing ? "Working…" : toPush ? `Push ${toPush} commit(s)` : "Nothing to push"}
+          </button>
+        </div>
+      )}
+      {git.merging && (
+        <section aria-label="Merge in progress" className="space-y-2 rounded-2xl border border-primary/60 p-3 text-sm">
+          <p className="font-semibold text-fg">Merge in progress: {git.merging.message}</p>
+          {git.merging.unresolved.length > 0 ? (
+            <>
+              <p className="text-xs text-muted">
+                Conflicts are marked in the files with &lt;&lt;&lt;&lt;&lt;&lt;&lt; ours / ======= / &gt;&gt;&gt;&gt;&gt;&gt;&gt; theirs. Edit each file to the version you want, remove the markers, then stage it.
+              </p>
+              <ul className="space-y-1">
+                {git.merging.unresolved.map((path) => (
+                  <li key={path} className="flex items-center justify-between gap-2">
+                    <span className="min-w-0 truncate font-mono text-xs">{path}</span>
+                    <button type="button" onClick={() => gitAdd([path])} className="min-h-9 shrink-0 rounded-full border border-border px-3 text-xs">
+                      Mark fixed
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : (
+            <p className="text-xs text-muted">All conflicts are staged. Commit to finish the merge.</p>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              const result = Git.abortMerge(git);
+              if (typeof result === "string") setNotice(result);
+              else {
+                applyGit(result.git, result.changes);
+                setNotice("Merge aborted.");
+              }
+            }}
+            className="min-h-9 rounded-full border border-border px-3 text-xs"
+          >
+            Abort merge
+          </button>
+        </section>
       )}
 
       <section aria-label="Changes not staged" className="space-y-2">
@@ -147,21 +201,31 @@ export function GitPanel() {
           className="flex gap-2"
           onSubmit={(event) => {
             event.preventDefault();
-            if (!message.trim()) return;
-            const ok = gitCommit(message.trim());
-            setNotice(ok ? "" : "Nothing staged to commit.");
+            const text = message.trim() || git.merging?.message || "";
+            if (!text) return;
+            const blockers = Git.mergeBlockers(git);
+            if (blockers.length) {
+              setNotice(blockers.join(" · "));
+              return;
+            }
+            const ok = gitCommit(text);
+            setNotice(ok ? (git.merging ? "Merge committed." : "") : "Nothing staged to commit.");
             if (ok) setMessage("");
           }}
         >
           <input
             value={message}
             onChange={(event) => setMessage(event.target.value)}
-            placeholder="Commit message"
+            placeholder={git.merging ? git.merging.message : "Commit message"}
             aria-label="Commit message"
             className="min-h-11 min-w-0 flex-1 rounded-2xl border border-border bg-bg px-3 text-sm outline-none"
           />
-          <button type="submit" disabled={!message.trim() || state.staged.length === 0} className="min-h-11 rounded-2xl bg-primary px-4 text-sm font-semibold text-on-primary disabled:opacity-40">
-            Commit
+          <button
+            type="submit"
+            disabled={git.merging ? git.merging.unresolved.length > 0 : !message.trim() || state.staged.length === 0}
+            className="min-h-11 rounded-2xl bg-primary px-4 text-sm font-semibold text-on-primary disabled:opacity-40"
+          >
+            {git.merging ? "Commit merge" : "Commit"}
           </button>
         </form>
       </section>
@@ -190,7 +254,7 @@ export function GitPanel() {
             );
           })}
         </ul>
-        <p className="text-xs text-muted">In the terminal: git restore &lt;path&gt;, git checkout &lt;commit&gt; -- &lt;path&gt;, git merge &lt;branch&gt; (fast-forward only), git branch -d &lt;branch&gt;.</p>
+        <p className="text-xs text-muted">In the terminal: git restore &lt;path&gt;, git checkout &lt;commit&gt; -- &lt;path&gt;, git merge &lt;branch&gt;, git merge --abort, git branch -d &lt;branch&gt;.</p>
       </section>
     </div>
   );

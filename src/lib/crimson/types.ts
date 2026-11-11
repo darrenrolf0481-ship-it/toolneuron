@@ -88,6 +88,8 @@ export type GitCommit = {
   time: string;
   /** The commit before this one. */
   parent?: string;
+  /** The other parent of a merge commit (the branch or pulled commit merged in). */
+  parent2?: string;
   /** Missing on commits made before history was real (they recorded only a message). */
   tree?: GitTree;
 };
@@ -107,6 +109,21 @@ export type GitState = {
   branches?: Record<string, string | undefined>;
   /** The GitHub repository this project pushes to, if linked. */
   remote?: GitRemote;
+  /** Set while a merge waits for conflicts to be resolved. */
+  merging?: GitMerging;
+};
+
+export type GitMerging = {
+  /** Commit being merged in (becomes the merge commit's second parent). */
+  theirs: string;
+  /** Message the merge commit will get. */
+  message: string;
+  /** Paths with conflicts not yet staged with `git add`. */
+  unresolved: string[];
+  /** Every conflicted path (for status). */
+  conflicts: string[];
+  /** Paths the merge changed in the working files (restored by --abort). */
+  touched: string[];
 };
 
 export type GitRemote = {

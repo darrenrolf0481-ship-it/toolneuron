@@ -5,6 +5,7 @@ import { streamChat } from "./stream-chat";
 import { exportVaultBlob, importVaultBlob } from "./vault/vault-store";
 import { findHandoff, formatHandoff, HANDOFF_NAME, stripModeLabel } from "./handoff";
 import * as Git from "./git";
+import { mergeLines } from "./terminal";
 import {
   activePersonality,
   historyForModel,
@@ -112,6 +113,8 @@ export type OsState = {
   applyGit: (git: GitState, changes?: Git.FileChange[]) => void;
   /** Pushes the current branch's unpushed commits to the linked GitHub repo. */
   gitPush: () => Promise<{ ok: boolean; message: string }>;
+  /** Fetches new GitHub commits for the current branch and merges them in. */
+  gitPull: () => Promise<{ ok: boolean; message: string }>;
   /** Copies a public GitHub repo's text files into the project (owner/name). */
   cloneRepo: (repo: string) => Promise<void>;
   addPack: (pack: Pack) => void;
@@ -654,6 +657,53 @@ export const useOs = create<OsState>((set, get) => ({
     set({ git: Git.markPushed(Git.normalizeGit(get().git), plan.commits.map((commit) => commit.id), result.shas, plan.branch) });
     return done(true, `${result.created ? "Created" : "Updated"} ${plan.repo} ${plan.branch}: ${plan.commits.length} commit(s), now at ${result.shas.at(-1)?.slice(0, 7)}`, [`[INFO] ${result.url}`]);
   },
+  gitPull: async () => {
+    const say = (lines: string[]) => get().pushTerminal(lines);
+    const fail = (message: string) => {
+      say([`[ERROR] ${message}`]);
+      return { ok: false, message };
+    };
+    get().flushDraft();
+    const git = Git.normalizeGit(get().git);
+    const remote = git.remote;
+    if (!remote) return fail("no remote to pull from");
+    const base = Git.newestOnGitHub(git);
+    if (!base) return fail(`nothing on this branch is known to be on GitHub yet; push it first, or clone ${remote.repo} again`);
+    const work = Git.workingFiles(get().files);
+    const pending = Git.dirty(git, work);
+    if (pending.length) return fail(`commit or restore your changes first: ${pending.slice(0, 5).join(", ")}`);
+    const branch = remote.track[git.branch] ?? git.branch;
+    say([`Pulling ${remote.repo} ${branch}…`]);
+    let result: { ok: boolean; error?: string; note?: string; commits?: (Git.RemoteCommit & { skipped: string[] })[] };
+    try {
+      const response = await fetch("/api/git/fetch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: remote.repo, branch, base: remote.shas[base.id] }) });
+      result = await response.json();
+    } catch {
+      return fail("The pull request failed (network).");
+    }
+    if (!result.ok || !result.commits) return fail(result.error ?? "Pull failed.");
+    if (result.commits.length === 0) {
+      const message = result.note ?? "Already up to date.";
+      say([`[INFO] ${message}`]);
+      return { ok: true, message };
+    }
+    // The user may have kept working while the request ran.
+    const now = Git.normalizeGit(get().git);
+    const time = new Date().toLocaleString();
+    const replayed = Git.replayRemote(now, remote.shas[base.id], result.commits, time);
+    if (typeof replayed === "string") return fail(replayed);
+    const merged = Git.mergeInto(replayed.git, Git.workingFiles(get().files), replayed.tip, `Merge ${remote.repo} ${branch} into ${now.branch}`, time);
+    if (typeof merged === "string") return fail(merged);
+    const view = mergeLines(now, merged);
+    if (view.effect?.type === "git") get().applyGit(view.effect.git, view.effect.changes);
+    const skipped = result.commits.flatMap((item) => item.skipped);
+    say([
+      `[INFO] Fetched ${result.commits.length} commit(s): ${result.commits.map((item) => item.message.split("\n")[0]).slice(0, 3).join("; ")}${result.commits.length > 3 ? "; …" : ""}`,
+      ...view.lines,
+      ...(skipped.length ? [`[INFO] Not copied (binary or too large; left as they are here): ${[...new Set(skipped)].slice(0, 5).join(", ")}`] : []),
+    ]);
+    return { ok: merged.conflicts.length === 0, message: merged.note };
+  },
   cloneRepo: async (repo) => {
     const say = (lines: string[]) => get().pushTerminal(lines);
     let result: {
@@ -726,7 +776,7 @@ export const useOs = create<OsState>((set, get) => ({
       set({ git: linked });
       lines.push(
         `[INFO] Linked: project/${dir}/ pushes to ${repo} (${committed.branch} → ${result.branch}). Commit there, then git push.`,
-        "[INFO] Pull is not available: to pick up changes made on GitHub, clone again.",
+        "[INFO] git pull brings in changes made on GitHub; git push sends yours.",
       );
     } else if (result.linked && git.remote) {
       lines.push(`[INFO] A plain copy: this project already pushes to ${git.remote.repo} (one remote per project).`);

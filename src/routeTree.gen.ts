@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiChatRouteImport } from './routes/api/chat'
 import { Route as ApiCloneRouteImport } from './routes/api/clone'
+import { Route as ApiGitFetchRouteImport } from './routes/api/git/fetch'
 import { Route as ApiGitPushRouteImport } from './routes/api/git/push'
 
 const IndexRoute = IndexRouteImport.update({
@@ -29,6 +30,11 @@ const ApiCloneRoute = ApiCloneRouteImport.update({
   path: '/api/clone',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiGitFetchRoute = ApiGitFetchRouteImport.update({
+  id: '/api/git/fetch',
+  path: '/api/git/fetch',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiGitPushRoute = ApiGitPushRouteImport.update({
   id: '/api/git/push',
   path: '/api/git/push',
@@ -39,12 +45,14 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/api/chat': typeof ApiChatRoute
   '/api/clone': typeof ApiCloneRoute
+  '/api/git/fetch': typeof ApiGitFetchRoute
   '/api/git/push': typeof ApiGitPushRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/api/chat': typeof ApiChatRoute
   '/api/clone': typeof ApiCloneRoute
+  '/api/git/fetch': typeof ApiGitFetchRoute
   '/api/git/push': typeof ApiGitPushRoute
 }
 export interface FileRoutesById {
@@ -52,20 +60,29 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/api/chat': typeof ApiChatRoute
   '/api/clone': typeof ApiCloneRoute
+  '/api/git/fetch': typeof ApiGitFetchRoute
   '/api/git/push': typeof ApiGitPushRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/api/chat' | '/api/clone' | '/api/git/push'
+  fullPaths:
+    '/' | '/api/chat' | '/api/clone' | '/api/git/fetch' | '/api/git/push'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/api/chat' | '/api/clone' | '/api/git/push'
-  id: '__root__' | '/' | '/api/chat' | '/api/clone' | '/api/git/push'
+  to: '/' | '/api/chat' | '/api/clone' | '/api/git/fetch' | '/api/git/push'
+  id:
+    | '__root__'
+    | '/'
+    | '/api/chat'
+    | '/api/clone'
+    | '/api/git/fetch'
+    | '/api/git/push'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiChatRoute: typeof ApiChatRoute
   ApiCloneRoute: typeof ApiCloneRoute
+  ApiGitFetchRoute: typeof ApiGitFetchRoute
   ApiGitPushRoute: typeof ApiGitPushRoute
 }
 
@@ -92,6 +109,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiCloneRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/git/fetch': {
+      id: '/api/git/fetch'
+      path: '/api/git/fetch'
+      fullPath: '/api/git/fetch'
+      preLoaderRoute: typeof ApiGitFetchRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/git/push': {
       id: '/api/git/push'
       path: '/api/git/push'
@@ -106,6 +130,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiChatRoute: ApiChatRoute,
   ApiCloneRoute: ApiCloneRoute,
+  ApiGitFetchRoute: ApiGitFetchRoute,
   ApiGitPushRoute: ApiGitPushRoute,
 }
 export const routeTree = rootRouteImport

@@ -128,7 +128,7 @@ describe("git (real history)", () => {
     assert.match(out[1][0], /Nothing staged/);
     assert.match(out[2][0], /did not match any files/);
     assert.match(out[3][0], /no remote/);
-    assert.match(out[4][0], /not available/);
+    assert.match(out[4][0], /no remote to pull from/);
     assert.match(out[5][0], /already on 'main'/);
   });
 });
@@ -165,6 +165,57 @@ describe("git branches", () => {
     const edited = s.files.map((f) => (f.id === "a" ? { ...f, content: "dirty" } : f));
     assert.match(interpret("git switch other", { cwd: `${ROOT}/project`, files: edited, git: s.state }).lines[0], /commit or restore your changes first: src\/main\.py/);
     assert.match(interpret("git branch bad..name", { cwd: ROOT, files, git: s.state }).lines[0], /not a valid branch name/);
+  });
+});
+
+describe("git merge with conflicts", () => {
+  it("merge → CONFLICT → status → blocked commit → fix, add, commit; and --abort", () => {
+    let state: GitState = { ...EMPTY_GIT };
+    let current = files.map((file) => ({ ...file }));
+    const run = (command: string) => {
+      const result = interpret(command, { cwd: `${ROOT}/project`, files: current, git: state });
+      if (result.effect?.type === "git") {
+        state = result.effect.git;
+        current = applyChanges(current, result.effect.changes ?? [], (n) => `x${n}${Math.random()}`, () => "text");
+      }
+      return result.lines.join("\n");
+    };
+    const edit = (id: string, content: string) => (current = current.map((f) => (f.id === id ? { ...f, content } : f)));
+    run("git init");
+    run("git add .");
+    run('git commit -m "base"');
+    run("git switch -c other");
+    edit("d", "# other");
+    run("git add .");
+    run('git commit -m "other readme"');
+    run("git switch main");
+    edit("d", "# main");
+    run("git add .");
+    run('git commit -m "main readme"');
+    const merged = run("git merge other");
+    assert.match(merged, /\[WARN\] Automatic merge failed in 1 file/);
+    assert.match(merged, /CONFLICT in README\.md/);
+    assert.match(current.find((f) => f.id === "d")!.content!, /<<<<<<< ours\n# main\n=======\n# other\n>>>>>>> theirs/);
+    assert.match(run("git status"), /Unmerged paths[\s\S]*both modified: README\.md/);
+    assert.match(run("git commit"), /cannot commit the merge yet[\s\S]*README\.md: still conflicted/);
+    assert.match(run("git switch other"), /merge is in progress/);
+    edit("d", "# main and other");
+    run("git add README.md");
+    assert.match(run("git commit"), /\[SUCCESS\] \[main [0-9a-f]{7}\] Merge branch 'other' into main/);
+    assert.match(run("git log"), /Merge branch 'other' into main {2}\(merge\)/);
+    // Abort path.
+    run("git switch -c again");
+    edit("d", "# again");
+    run("git add .");
+    run('git commit -m "again"');
+    run("git switch main");
+    edit("d", "# main 2");
+    run("git add .");
+    run('git commit -m "main 2"');
+    run("git merge again");
+    assert.match(run("git merge --abort"), /Merge aborted; 1 file\(s\) put back/);
+    assert.equal(current.find((f) => f.id === "d")!.content, "# main 2");
+    assert.match(run("git status"), /working tree clean/);
   });
 });
 

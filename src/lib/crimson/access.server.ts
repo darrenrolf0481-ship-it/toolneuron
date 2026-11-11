@@ -130,14 +130,15 @@ export function guardAiCall(): string | null {
 const clones = new Map<string, number[]>();
 
 /**
- * Guard for /api/clone: same site, unlocked, and at most CLONE_PER_MIN
- * (default 4) clones a minute per client. Separate from the AI budget.
+ * Guard for the GitHub endpoints (clone, pull, push): same site, unlocked,
+ * and at most CLONE_PER_MIN (default 12) calls a minute per client, shared
+ * by the three. Separate from the AI budget.
  */
 export function guardCloneCall(): string | null {
   assertSameSiteRequest();
   const state = accessState();
   if (state === "unconfigured") return "Cloning is disabled: set APP_ACCESS_KEY on the server.";
   if (state === "locked") return "Locked. Enter the access key (header lock) to clone.";
-  if (!hit(clones, clientIp(), 60_000, intEnv("CLONE_PER_MIN", 4))) return "Slow down: too many clones this minute.";
+  if (!hit(clones, clientIp(), 60_000, intEnv("CLONE_PER_MIN", 12))) return "Slow down: too many clones this minute.";
   return null;
 }

@@ -18,7 +18,7 @@ after(async () => {
   await browser?.close();
 });
 
-async function openApp({ clone, push } = {}) {
+async function openApp({ clone, push, fetch: fetchReply } = {}) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 844 } });
   const page = await context.newPage();
   const errors = [];
@@ -36,6 +36,9 @@ async function openApp({ clone, push } = {}) {
     pushes.push(route.request().postDataJSON());
     const reply = typeof push === "function" ? push(pushes.at(-1)) : (push ?? { ok: false, error: "no fake set" });
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(reply) });
+  });
+  await page.route("**/api/git/fetch", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(fetchReply ?? { ok: false, error: "no fake set" }) });
   });
   await page.addInitScript(() => {
     if (sessionStorage.getItem("e2e-seeded")) return;
@@ -85,7 +88,7 @@ describe("terminal git", () => {
     out = await app.term("git push");
     assert.match(out, /no remote/);
     out = await app.term("git pull");
-    assert.match(out, /not available/);
+    assert.match(out, /no remote to pull from/);
     const state = await app.saved();
     assert.equal(state.git.commits[0].message, "start");
     assert.ok(Object.keys(state.git.commits[0].tree).includes("src/neural_brain.py"));
@@ -196,7 +199,8 @@ describe("branches and push", () => {
     const plan = app.pushes[0];
     assert.equal(plan.repo, "me/site");
     assert.equal(plan.branch, "main");
-    assert.equal(plan.parentSha, sha("a"));
+    assert.equal(plan.expectSha, sha("a"));
+    assert.deepEqual(plan.commits[0].parents, [{ sha: sha("a") }]);
     assert.equal(plan.commits.length, 1);
     assert.deepEqual(plan.commits[0].changes.map((c) => c.path), ["index.html"], "only paths inside the repo folder, relative to it");
     assert.match(plan.commits[0].changes[0].content, /<p>edited<\/p>/);
@@ -228,7 +232,7 @@ describe("branches and push", () => {
     await app.page.getByRole("button", { name: "Stage all" }).click();
     await app.page.getByLabel("Commit message").fill("fix a");
     await app.page.getByRole("button", { name: "Commit" }).click();
-    await app.page.getByRole("button", { name: /Push 1 commit\(s\) to me\/site/ }).click();
+    await app.page.getByRole("button", { name: /Push 1 commit\(s\)/ }).click();
     await app.page.waitForTimeout(400);
     assert.match(await app.page.getByRole("status").last().innerText(), /Rejected: .*not a fast-forward/);
     assert.equal(app.pushes[0].branch, "fix", "a new local branch pushes to the same name");
@@ -246,6 +250,56 @@ describe("branches and push", () => {
     state = await app.saved();
     assert.equal(state.files.find((f) => f.name === "a.txt").content, "12", "fix keeps its edit");
     assert.ok(state.files.some((f) => f.name === "neural_brain.py"), "back on fix, the committed starter files return");
+    await app.close();
+  });
+});
+
+describe("pull and merge conflicts", () => {
+  const sha = (c) => c.repeat(40);
+  it("pull brings a conflict; resolving it in the Git tab and pushing sends a merge commit", async () => {
+    const app = await openApp({
+      clone: { ok: true, repo: "me/site", linked: true, sha: sha("a"), branch: "main", files: [{ path: "page.txt", content: "title\nbody\nfooter" }], skipped: {} },
+      fetch: { ok: true, head: sha("b"), commits: [{ sha: sha("b"), message: "Edit on GitHub", changes: [{ path: "page.txt", content: "title\nBODY FROM GITHUB\nfooter" }], skipped: [] }] },
+      push: (plan) => ({ ok: true, shas: plan.commits.map((_, i) => String(i + 1).repeat(40)), url: "https://github.com/me/site/tree/main", created: false }),
+    });
+    await app.page.getByRole("button", { name: "Term" }).first().click();
+    await app.term("gh repo clone me/site");
+    await app.page.waitForTimeout(400);
+    // A local edit to the same line, committed.
+    await app.page.getByRole("button", { name: "Edit" }).first().click();
+    await app.page.getByText("page.txt", { exact: true }).click();
+    await app.page.locator(".cm-content").click();
+    await app.page.keyboard.press("Control+a");
+    await app.page.keyboard.type("title\nbody edited here\nfooter");
+    await app.page.getByRole("button", { name: "Term" }).first().click();
+    await app.term("git add .");
+    await app.term('git commit -m "local edit"');
+    await app.term("git pull");
+    await app.page.waitForTimeout(600);
+    const text = await app.page.locator(".os-scroll").first().innerText();
+    assert.match(text, /Fetched 1 commit\(s\): Edit on GitHub/);
+    assert.match(text, /CONFLICT in site\/page\.txt/);
+    assert.match(await app.term("cat project/site/page.txt"), /<<<<<<< ours[\s\S]*body edited here[\s\S]*=======[\s\S]*BODY FROM GITHUB[\s\S]*>>>>>>> theirs/);
+    // Resolve in the editor, mark fixed and commit from the Git tab.
+    await app.page.getByRole("button", { name: "Edit" }).first().click();
+    await app.page.getByRole("button", { name: "code", exact: true }).click();
+    await app.page.locator(".cm-content").click();
+    await app.page.keyboard.press("Control+a");
+    await app.page.keyboard.type("title\nbody edited here, plus GitHub's\nfooter");
+    await app.page.getByRole("button", { name: "git", exact: true }).click();
+    const banner = app.page.getByRole("region", { name: "Merge in progress" });
+    assert.match(await banner.innerText(), /site\/page\.txt/);
+    await banner.getByRole("button", { name: "Mark fixed" }).click();
+    assert.match(await banner.innerText(), /All conflicts are staged/);
+    await app.page.getByRole("button", { name: "Commit merge" }).click();
+    assert.equal(await banner.count(), 0);
+    await app.page.getByRole("button", { name: /Push 2 commit\(s\)/ }).click();
+    await app.page.waitForTimeout(500);
+    const plan = app.pushes[0];
+    assert.equal(plan.expectSha, sha("b"), "fast-forward from what GitHub has now");
+    assert.deepEqual(plan.commits.map((c) => c.parents), [[{ sha: sha("a") }], [{ index: 0 }, { sha: sha("b") }]]);
+    assert.match(plan.commits[1].changes[0].content, /plus GitHub's/);
+    assert.deepEqual(app.errors, []);
     await app.close();
   });
 });

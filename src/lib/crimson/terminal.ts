@@ -10,7 +10,8 @@ export type TermEffect =
   | { type: "run"; fileId: string; fileName: string }
   /** New git state, and file changes to apply (restore, checkout, switch, merge). */
   | { type: "git"; git: GitState; changes?: Git.FileChange[] }
-  | { type: "push" };
+  | { type: "push" }
+  | { type: "pull" };
 
 export type TermCtx = {
   cwd: string;
@@ -232,9 +233,10 @@ const GIT_HELP = [
   "git init | status | add <path>|. | commit -m \"msg\"",
   "git log [-n N] | diff [--staged] [path] | show [commit]",
   "git restore [--staged] <path> | checkout <commit> -- <path>",
-  "git branch [-d|-D name | name] | switch [-c] <name> | checkout [-b] <name> | merge <name>",
-  "git remote [-v] | remote add origin owner/name [folder] | remote remove origin | push",
-  "History lives in this browser. Merges are fast-forward only. Pull is not available.",
+  "git branch [-d|-D name | name] | switch [-c] <name> | checkout [-b] <name>",
+  "git merge <branch> | merge --abort   (conflicts get <<<<<<< markers: fix, git add, git commit)",
+  "git remote [-v] | remote add origin owner/name [folder] | remote remove origin | pull | push",
+  "History lives in this browser; GitHub is reached only by clone, pull and push.",
 ];
 
 /** Turns a terminal path argument into repo paths ("src/main.py"); a folder expands to the files under it. */
@@ -276,6 +278,11 @@ function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffe
     const state = Git.status(repo, work());
     const head = Git.headCommit(repo);
     const lines = [`On branch ${repo.branch}${head ? `, last commit ${head.id} ${head.message}` : ", no commits yet"}`];
+    if (repo.merging) {
+      lines.push(`Merging (${repo.merging.message}).`);
+      if (repo.merging.unresolved.length) lines.push("Unmerged paths (fix the markers, then git add <path>):", ...repo.merging.unresolved.map((path) => `  both modified: ${path}`));
+      else lines.push("All conflicts fixed: run git commit to finish the merge (or git merge --abort).");
+    }
     if (state.staged.length) lines.push("Changes to be committed:", ...changeLines(state.staged));
     if (state.unstaged.length) lines.push("Changes not staged (git add <path>):", ...changeLines(state.unstaged));
     if (state.untracked.length) lines.push("Untracked files (git add <path>):", ...state.untracked.map((path) => `  ${path}`));
@@ -296,8 +303,10 @@ function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffe
   }
 
   if (sub === "commit") {
-    const message = args.slice(1).join(" ").replace(/^-m\s*/, "").replace(/^["']|["']$/g, "").trim();
+    const message = args.slice(1).join(" ").replace(/^-m\s*/, "").replace(/^["']|["']$/g, "").trim() || repo.merging?.message || "";
     if (!message) return { lines: ['[ERROR] git commit -m "message"'] };
+    const blockers = Git.mergeBlockers(repo);
+    if (blockers.length) return { lines: ["[ERROR] cannot commit the merge yet:", ...blockers.map((line) => `  ${line}`)] };
     const next = Git.commit(repo, message, new Date().toLocaleString());
     if (!next) return { lines: ["[WARN] Nothing staged. git add <path> first (git status shows what changed)."] };
     const made = next.commits[0];
@@ -307,9 +316,16 @@ function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffe
 
   if (sub === "log") {
     const n = Number(args[args.indexOf("-n") + 1]) || (args.find((arg) => /^-\d+$/.test(arg)) ? Number(args.find((arg) => /^-\d+$/.test(arg))!.slice(1)) : 10);
-    if (repo.commits.length === 0) return { lines: ["[INFO] no commits yet"] };
+    const line = Git.history(repo);
+    if (line.length === 0) return { lines: ["[INFO] no commits yet"] };
+    const onGitHub = repo.remote?.shas ?? {};
     return {
-      lines: repo.commits.slice(0, n).map((commit) => `${commit.id}  ${commit.time}  ${commit.message}${commit.tree ? "" : "  (no snapshot: made before history was real)"}`),
+      lines: line
+        .slice(0, n)
+        .map(
+          (commit) =>
+            `${commit.id}  ${commit.time}  ${commit.message}${commit.parent2 ? "  (merge)" : ""}${onGitHub[commit.id] ? `  [GitHub ${onGitHub[commit.id].slice(0, 7)}]` : ""}${commit.tree ? "" : "  (no snapshot: made before history was real)"}`,
+        ),
     };
   }
 
@@ -388,12 +404,19 @@ function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffe
   }
 
   if (sub === "merge") {
+    if (args[1] === "--abort") {
+      const result = Git.abortMerge(repo);
+      if (typeof result === "string") return { lines: [`[ERROR] ${result}`] };
+      return { lines: [`[SUCCESS] Merge aborted; ${result.changes.length} file(s) put back`], effect: { type: "git", git: result.git, changes: result.changes } };
+    }
     const name = args[1];
-    if (!name) return { lines: ["[ERROR] git merge <branch>"] };
-    const result = Git.mergeBranch(repo, work(), name);
+    if (!name) return { lines: ["[ERROR] git merge <branch> | git merge --abort"] };
+    const result = Git.mergeBranch(repo, work(), name, new Date().toLocaleString());
     if (typeof result === "string") return { lines: [`[ERROR] ${result}`] };
-    return { lines: [`[SUCCESS] ${result.note}${result.changes.length ? ` (${result.changes.length} file(s) updated)` : ""}`], effect: result.changes.length || result.git !== repo ? { type: "git", git: result.git, changes: result.changes } : undefined };
+    return mergeLines(repo, result);
   }
+
+  if (sub === "pull") return repo.remote ? { lines: [], effect: { type: "pull" } } : { lines: ["[ERROR] no remote to pull from"] };
 
   if (sub === "remote") {
     const action = args[1];
@@ -441,10 +464,18 @@ function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffe
     return writeBack(repo, { ...repo, index }, paths, tree, ctx, `checked out from ${commit.id}`);
   }
 
-  if (sub === "pull" || sub === "fetch" || sub === "rebase") {
-    return { lines: [`[INFO] git ${sub} is not available. To pick up changes made on GitHub, clone the repo again.`] };
+  if (sub === "fetch" || sub === "rebase") {
+    return { lines: [`[INFO] git ${sub} is not available on its own: git pull fetches and merges in one step.`] };
   }
   return { lines: GIT_HELP };
+}
+
+/** Terminal lines and effect for a merge result (git merge and git pull). */
+export function mergeLines(repo: GitState, result: Git.MergeResult): { lines: string[]; effect?: TermEffect } {
+  const lines = [`${result.conflicts.length ? "[WARN]" : "[SUCCESS]"} ${result.note}${result.changes.length && !result.conflicts.length ? ` (${result.changes.length} file(s) updated)` : ""}`];
+  for (const path of result.conflicts) lines.push(`  CONFLICT in ${path}`);
+  const changed = result.changes.length > 0 || result.git !== repo;
+  return { lines, effect: changed ? { type: "git", git: result.git, changes: result.changes } : undefined };
 }
 
 /** Writes the contents `source` holds for `paths` into the project, recreating files that were deleted. */

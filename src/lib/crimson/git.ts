@@ -12,9 +12,9 @@
  *
  * Pure functions: every change returns a new GitState.
  */
-import type { GitCommit as Commit, GitRemote as Remote, GitState, GitTree as Tree, ProjectFile } from "./types.ts";
+import type { GitCommit as Commit, GitMerging as Merging, GitRemote as Remote, GitState, GitTree as Tree, ProjectFile } from "./types.ts";
 
-export type { Commit, GitState, Remote, Tree };
+export type { Commit, GitState, Merging, Remote, Tree };
 
 export const MAX_COMMITS = 50;
 /** Larger files are diffed as "changed" instead of line by line. */
@@ -45,6 +45,7 @@ export function normalizeGit(raw: unknown): GitState {
     blobs: git.blobs && typeof git.blobs === "object" ? git.blobs : {},
     branches,
     ...(remote ? { remote } : {}),
+    ...(git.merging && typeof git.merging.theirs === "string" ? { merging: git.merging } : {}),
   };
 }
 
@@ -98,8 +99,28 @@ export function headCommit(git: GitState): Commit | undefined {
   return byId(git, branches[git.branch]);
 }
 
-/** Commits from `from` back through parents, newest first (stops where history was trimmed). */
+/** Every commit reachable from `from` through both parents, newest first (stops where history was trimmed). */
 export function history(git: GitState, from: string | undefined = headCommit(git)?.id): Commit[] {
+  const order = new Map(git.commits.map((commit, index) => [commit.id, index]));
+  const out: Commit[] = [];
+  const seen = new Set<string>();
+  const stack = from ? [from] : [];
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const commit = byId(git, id);
+    if (!commit) continue;
+    out.push(commit);
+    if (commit.parent) stack.push(commit.parent);
+    if (commit.parent2) stack.push(commit.parent2);
+  }
+  // Commits are stored newest first, and a commit is always stored after its parents exist.
+  return out.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+}
+
+/** The first-parent line from `from` (what HEAD~n walks). */
+export function firstParents(git: GitState, from: string | undefined): Commit[] {
   const out: Commit[] = [];
   const seen = new Set<string>();
   let commit = byId(git, from);
@@ -109,6 +130,12 @@ export function history(git: GitState, from: string | undefined = headCommit(git
     commit = byId(git, commit.parent);
   }
   return out;
+}
+
+/** The newest commit both `a` and `b` reach: where their histories split. */
+export function mergeBase(git: GitState, a: string | undefined, b: string | undefined): Commit | undefined {
+  const reach = new Set(history(git, b).map((commit) => commit.id));
+  return history(git, a).find((commit) => reach.has(commit.id));
 }
 
 /** True when commit `ancestor` is `of` or one of its parents. */
@@ -184,22 +211,44 @@ export function add(git: GitState, work: Record<string, string>, paths: string[]
       added.push(path);
     } else missing.push(path);
   }
-  return { git: { ...git, index, blobs }, added, missing };
+  const merging = git.merging ? { ...git.merging, unresolved: git.merging.unresolved.filter((path) => !(all || targets.includes(path))) } : undefined;
+  return { git: { ...git, index, blobs, ...(merging ? { merging } : {}) }, added, missing };
 }
 
-/** Records the index as a new commit. Returns null when nothing is staged. */
+/**
+ * Records the index as a new commit. Returns null when nothing is staged.
+ * While merging (see mergeBlockers), it records the merge commit, with the
+ * merged-in commit as second parent, even if the tree did not change.
+ */
 export function commit(git: GitState, message: string, time: string): GitState | null {
   const index = git.index ?? {};
-  if (compareTrees(headTree(git), index).length === 0) return null;
+  const merging = git.merging;
+  if (!merging && compareTrees(headTree(git), index).length === 0) return null;
   const parent = headCommit(git)?.id;
-  const id = hash(`${parent ?? ""}\n${time}\n${message}\n${JSON.stringify(index)}\n${git.commits.length}`).slice(0, 7);
+  const id = hash(`${parent ?? ""}\n${merging?.theirs ?? ""}\n${time}\n${message}\n${JSON.stringify(index)}\n${git.commits.length}`).slice(0, 7);
   const branches = { ...(git.branches ?? {}), [git.branch]: id };
-  return trim({ ...git, branches, commits: [{ id, message, time, parent, tree: { ...index } }, ...git.commits] });
+  const made: Commit = { id, message, time, parent, ...(merging ? { parent2: merging.theirs } : {}), tree: { ...index } };
+  const next = { ...git, branches, commits: [made, ...git.commits] };
+  delete next.merging;
+  return trim(next);
+}
+
+/** Why a merge cannot be committed yet ([] when it can, or when not merging). */
+export function mergeBlockers(git: GitState): string[] {
+  const merging = git.merging;
+  if (!merging) return [];
+  const out = merging.unresolved.map((path) => `${path}: still conflicted (fix it, then git add ${path})`);
+  for (const path of merging.conflicts) {
+    const staged = blob(git, git.index?.[path]);
+    if (staged !== undefined && /^(<{7}|>{7}) /m.test(staged)) out.push(`${path}: the staged version still has conflict markers`);
+  }
+  return out;
 }
 
 /** Keeps the newest MAX_COMMITS commits plus every branch head, then drops unused blobs. */
 function trim(git: GitState): GitState {
   const heads = new Set(Object.values(git.branches ?? {}).filter((id): id is string => Boolean(id)));
+  if (git.merging) heads.add(git.merging.theirs);
   const commits = git.commits.filter((commit, index) => index < MAX_COMMITS || heads.has(commit.id));
   return collect({ ...git, commits });
 }
@@ -217,10 +266,10 @@ export function findCommit(git: GitState, ref: string): Commit | undefined {
   const base = back?.[1] ?? ref;
   const steps = Number(back?.[2] ?? 0);
   const start = /^HEAD$/i.test(base) ? headCommit(git)?.id : git.branches && base in git.branches ? git.branches[base] : undefined;
-  if (start !== undefined || /^HEAD$/i.test(base)) return history(git, start)[steps];
+  if (start !== undefined || /^HEAD$/i.test(base)) return firstParents(git, start)[steps];
   if (base.length < 4) return undefined;
   const matches = git.commits.filter((commit) => commit.id.startsWith(base));
-  return matches.length === 1 ? history(git, matches[0].id)[steps] : undefined;
+  return matches.length === 1 ? firstParents(git, matches[0].id)[steps] : undefined;
 }
 
 // ---------- branches ----------
@@ -237,6 +286,7 @@ export function treeChanges(git: GitState, from: Tree, to: Tree): FileChange[] {
 
 /** Uncommitted work that switching or merging would overwrite: staged changes and edits to tracked files. */
 export function dirty(git: GitState, work: Record<string, string>): string[] {
+  if (git.merging) return ["(a merge is in progress: commit it or git merge --abort)"];
   const state = status(git, work);
   return [...state.staged, ...state.unstaged].map((change) => change.path);
 }
@@ -273,22 +323,194 @@ export function switchBranch(git: GitState, work: Record<string, string>, name: 
   return { git: { ...git, branch: name, index: { ...target } }, changes: treeChanges(git, headTree(git), target) };
 }
 
-/** Fast-forward merge of `name` into the current branch (the only kind available). */
-export function mergeBranch(git: GitState, work: Record<string, string>, name: string): { git: GitState; changes: FileChange[]; note: string } | string {
+/**
+ * Merges branch `name` into the current one. Fast-forwards when possible;
+ * otherwise a three-way merge: a merge commit if every file merges cleanly,
+ * or a merge in progress (git.merging) with conflict markers in the files.
+ */
+export function mergeBranch(git: GitState, work: Record<string, string>, name: string, time: string): MergeResult | string {
   const branches = git.branches ?? {};
   if (!(name in branches)) return `branch '${name}' not found`;
+  if (name === git.branch) return `cannot merge '${name}' into itself`;
+  return mergeInto(git, work, branches[name], `Merge branch '${name}' into ${git.branch}`, time);
+}
+
+export type MergeResult = { git: GitState; changes: FileChange[]; note: string; conflicts: string[] };
+
+/** Merges commit `theirs` into the current branch (shared by git merge and git pull). */
+export function mergeInto(git: GitState, work: Record<string, string>, theirs: string | undefined, message: string, time: string): MergeResult | string {
+  const branches = git.branches ?? {};
   const ours = headCommit(git)?.id;
-  const theirs = branches[name];
-  if (isAncestor(git, theirs, ours)) return { git, changes: [], note: "Already up to date." };
-  if (!isAncestor(git, ours, theirs)) return `${git.branch} and ${name} have diverged; only fast-forward merges are available (no merge commits or conflict resolution)`;
+  if (theirs === undefined || isAncestor(git, theirs, ours)) return { git, changes: [], note: "Already up to date.", conflicts: [] };
   const pending = dirty(git, work);
-  if (pending.length) return `commit or restore your changes first: ${pending.slice(0, 5).join(", ")}`;
+  if (pending.length) return `commit or restore your changes first: ${pending.slice(0, 5).join(", ")}${pending.length > 5 ? ", …" : ""}`;
   const target = byId(git, theirs)?.tree ?? {};
+  if (isAncestor(git, ours, theirs)) {
+    return {
+      git: { ...git, branches: { ...branches, [git.branch]: theirs }, index: { ...target } },
+      changes: treeChanges(git, headTree(git), target),
+      note: `Fast-forward ${ours ?? "(empty)"}..${theirs}`,
+      conflicts: [],
+    };
+  }
+  const base = mergeBase(git, ours, theirs);
+  const merged = mergeTrees(git, base?.tree ?? {}, headTree(git), target);
+  const blobs = { ...(git.blobs ?? {}), ...merged.blobs };
+  const index = { ...merged.clean };
+  const touched = merged.changes.map((change) => change.path);
+  if (merged.conflicts.length === 0) {
+    const committed = commit({ ...git, blobs, index, merging: { theirs, message, unresolved: [], conflicts: [], touched } }, message, time)!;
+    return { git: committed, changes: merged.changes, note: `Merge made (${touched.length} file(s) from the other side).`, conflicts: [] };
+  }
   return {
-    git: { ...git, branches: { ...branches, [git.branch]: theirs }, index: { ...target } },
-    changes: treeChanges(git, headTree(git), target),
-    note: `Fast-forward ${ours ?? "(empty)"}..${theirs}`,
+    git: { ...git, blobs, index, merging: { theirs, message, unresolved: [...merged.conflicts], conflicts: [...merged.conflicts], touched } },
+    changes: merged.changes,
+    note: `Automatic merge failed in ${merged.conflicts.length} file(s); fix the conflict markers, git add each file, then git commit (or git merge --abort).`,
+    conflicts: merged.conflicts,
   };
+}
+
+/** Undoes a merge in progress: the index and the files it changed go back to the last commit. */
+export function abortMerge(git: GitState): { git: GitState; changes: FileChange[] } | string {
+  if (!git.merging) return "no merge in progress";
+  const head = headTree(git);
+  const changes = git.merging.touched.map((path) => ({ path, content: head[path] === undefined ? null : (blob(git, head[path]) ?? "") }));
+  const next: GitState = { ...git, index: { ...head } };
+  delete next.merging;
+  return { git: collect(next), changes };
+}
+
+/**
+ * Three-way merge of trees. For each path: unchanged on one side → take the
+ * other; changed on both → merge the lines (merge3). `clean` is the index
+ * to record (conflicted paths keep our version there until resolved);
+ * `changes` are what the working files must become.
+ */
+export function mergeTrees(git: GitState, base: Tree, ours: Tree, theirs: Tree): { clean: Tree; changes: FileChange[]; conflicts: string[]; blobs: Record<string, string> } {
+  const clean: Tree = { ...ours };
+  const changes: FileChange[] = [];
+  const conflicts: string[] = [];
+  const blobs: Record<string, string> = {};
+  const paths = [...new Set([...Object.keys(base), ...Object.keys(ours), ...Object.keys(theirs)])].sort();
+  for (const path of paths) {
+    const b = base[path];
+    const o = ours[path];
+    const t = theirs[path];
+    if (o === t || t === b) continue; // same on both sides, or only we changed it
+    if (o === b) {
+      // Only they changed it.
+      if (t === undefined) delete clean[path];
+      else clean[path] = t;
+      changes.push({ path, content: t === undefined ? null : (blob(git, t) ?? "") });
+      continue;
+    }
+    // Both changed it.
+    if (o === undefined || t === undefined) {
+      // Deleted on one side, changed on the other: keep the changed text and let the user decide.
+      const kept = blob(git, o ?? t) ?? "";
+      const side = o === undefined ? "deleted here, changed on the other side" : "changed here, deleted on the other side";
+      const text = `<<<<<<< CONFLICT: ${side}. Keep this file (remove these marker lines) or delete it, then git add.\n>>>>>>> \n${kept}`;
+      const id = hash(text);
+      blobs[id] = text;
+      changes.push({ path, content: text });
+      conflicts.push(path);
+      continue;
+    }
+    const result = merge3(blob(git, b), blob(git, o) ?? "", blob(git, t) ?? "");
+    const id = hash(result.text);
+    blobs[id] = result.text;
+    if (result.conflict) conflicts.push(path);
+    else clean[path] = id;
+    changes.push({ path, content: result.text });
+  }
+  return { clean, changes, conflicts, blobs };
+}
+
+type Hunk = { start: number; end: number; lines: string[] };
+
+/** Base-line ranges each side replaced, from a line diff. */
+function hunks(base: string[], other: string[]): Hunk[] | null {
+  const ops = lineOps(base, other);
+  if (!ops) return null;
+  const out: Hunk[] = [];
+  let at = 0;
+  let current: Hunk | null = null;
+  for (const op of ops) {
+    if (op.kind === " ") {
+      if (current) out.push(current);
+      current = null;
+      at++;
+      continue;
+    }
+    current ??= { start: at, end: at, lines: [] };
+    if (op.kind === "-") {
+      current.end++;
+      at++;
+    } else current.lines.push(op.text);
+  }
+  if (current) out.push(current);
+  return out;
+}
+
+/**
+ * Line-level three-way merge. Changes to different parts of the file both
+ * apply; overlapping changes that differ become a conflict block:
+ *   <<<<<<< ours / ======= / >>>>>>> theirs
+ */
+export function merge3(base: string | undefined, ours: string, theirs: string): { text: string; conflict: boolean } {
+  if (ours === theirs) return { text: ours, conflict: false };
+  if (base === undefined) base = "";
+  if (ours === base) return { text: theirs, conflict: false };
+  if (theirs === base) return { text: ours, conflict: false };
+  const B = base.split("\n");
+  const oursHunks = hunks(B, ours.split("\n"));
+  const theirsHunks = hunks(B, theirs.split("\n"));
+  if (!oursHunks || !theirsHunks) {
+    return { text: `<<<<<<< ours\n${ours}\n=======\n${theirs}\n>>>>>>> theirs (too large to merge line by line)`, conflict: true };
+  }
+  const all = [...oursHunks.map((hunk) => ({ ...hunk, side: "ours" as const })), ...theirsHunks.map((hunk) => ({ ...hunk, side: "theirs" as const }))].sort(
+    (a, b) => a.start - b.start || a.end - b.end,
+  );
+  const out: string[] = [];
+  let conflict = false;
+  let at = 0;
+  let k = 0;
+  while (k < all.length) {
+    // A region: hunks that overlap (or insert at the same point) are resolved together.
+    const region = [all[k]];
+    let end = all[k].end;
+    k++;
+    while (k < all.length && (all[k].start < end || all[k].start === region[region.length - 1].start)) {
+      region.push(all[k]);
+      end = Math.max(end, all[k].end);
+      k++;
+    }
+    const start = region[0].start;
+    out.push(...B.slice(at, start));
+    const rebuild = (side: "ours" | "theirs") => {
+      const mine = region.filter((hunk) => hunk.side === side);
+      const lines: string[] = [];
+      let pos = start;
+      for (const hunk of mine) {
+        lines.push(...B.slice(pos, hunk.start), ...hunk.lines);
+        pos = hunk.end;
+      }
+      lines.push(...B.slice(pos, end));
+      return { lines, touched: mine.length > 0 };
+    };
+    const o = rebuild("ours");
+    const t = rebuild("theirs");
+    if (!t.touched) out.push(...o.lines);
+    else if (!o.touched) out.push(...t.lines);
+    else if (o.lines.join("\n") === t.lines.join("\n")) out.push(...o.lines);
+    else {
+      conflict = true;
+      out.push("<<<<<<< ours", ...o.lines, "=======", ...t.lines, ">>>>>>> theirs");
+    }
+    at = end;
+  }
+  out.push(...B.slice(at));
+  return { text: out.join("\n"), conflict };
 }
 
 // ---------- remote (GitHub) ----------
@@ -310,41 +532,103 @@ export function removeRemote(git: GitState): GitState {
   return next;
 }
 
+/** A commit's parent in a push: a sha already on GitHub, or an earlier commit of the same push (by position). */
+export type PushParent = { sha: string } | { index: number };
+
 export type PushPlan = {
   repo: string;
   /** Remote branch to update. */
   branch: string;
   /**
-   * GitHub sha the new commits build on: the newest commit of this branch
-   * already on GitHub. The server only fast-forwards: the remote branch must
-   * be at this sha, or not exist yet. null = no commit of this branch is on
-   * GitHub (the remote branch must not exist).
+   * Where the remote branch must be for a fast-forward: the newest commit of
+   * this branch's history already on GitHub. null = none is (the remote
+   * branch must not exist yet).
    */
-  parentSha: string | null;
-  /** Unpushed local commits, oldest first, as changes under the remote's folder. */
-  commits: { id: string; message: string; changes: FileChange[] }[];
+  expectSha: string | null;
+  /** Unpushed commits, parents before children, as changes (relative to the remote folder) from their first parent. */
+  commits: { id: string; message: string; parents: PushParent[]; changes: FileChange[] }[];
 };
 
-/** What `git push` must send: every commit on the current branch after the newest one already on GitHub. */
+/** The newest commit reachable from the current branch that is known to be on GitHub. */
+export function newestOnGitHub(git: GitState): Commit | undefined {
+  const shas = git.remote?.shas ?? {};
+  return history(git).find((commit) => shas[commit.id]);
+}
+
+/** What `git push` must send: every commit reachable from the current branch that is not on GitHub yet. */
 export function pushPlan(git: GitState): PushPlan | string {
   const remote = git.remote;
   if (!remote) return "no remote. git remote add origin owner/name [folder] (or clone a repo while GITHUB_TOKEN is set)";
-  const line = history(git);
-  if (line.length === 0) return "nothing to push: no commits yet";
-  const knownIndex = line.findIndex((commit) => remote.shas[commit.id]);
+  if (git.merging) return "a merge is in progress: fix the conflicts and git commit (or git merge --abort) before pushing";
+  const reachable = history(git);
+  if (reachable.length === 0) return "nothing to push: no commits yet";
   const branch = remote.track[git.branch] ?? git.branch;
-  if (knownIndex === 0) return `Everything up-to-date (${remote.repo} ${branch})`;
-  const pending = (knownIndex === -1 ? line : line.slice(0, knownIndex)).reverse();
-  const base = knownIndex === -1 ? undefined : line[knownIndex];
-  const parentSha = base ? remote.shas[base.id] : null;
-  let previous = subtree(base?.tree ?? {}, remote.dir);
-  const commits = pending.map((commit) => {
-    const tree = subtree(commit.tree ?? {}, remote.dir);
-    const changes = treeChanges(git, previous, tree);
-    previous = tree;
-    return { id: commit.id, message: commit.message, changes };
+  const known = (id: string | undefined) => (id ? remote.shas[id] : undefined);
+  // Unpushed = reachable without passing through a commit already on GitHub.
+  const pending = new Set<string>();
+  const stack = [reachable[0].id];
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (pending.has(id) || known(id)) continue;
+    const commit = byId(git, id);
+    if (!commit) return "part of this history was trimmed (only the newest commits are kept), so it cannot be pushed";
+    pending.add(id);
+    if (commit.parent) stack.push(commit.parent);
+    if (commit.parent2) stack.push(commit.parent2);
+  }
+  if (pending.size === 0) return `Everything up-to-date (${remote.repo} ${branch})`;
+  // Stored newest first, parents before children once reversed.
+  const ordered = git.commits.filter((commit) => pending.has(commit.id)).reverse();
+  const position = new Map(ordered.map((commit, index) => [commit.id, index]));
+  const commits = ordered.map((commit) => {
+    const parents: PushParent[] = [commit.parent, commit.parent2]
+      .filter((id): id is string => Boolean(id))
+      .map((id) => (known(id) ? { sha: known(id)! } : { index: position.get(id)! }));
+    const before = subtree(byId(git, commit.parent)?.tree ?? {}, remote.dir);
+    return { id: commit.id, message: commit.message, parents, changes: treeChanges(git, before, subtree(commit.tree ?? {}, remote.dir)) };
   });
-  return { repo: remote.repo, branch, parentSha, commits };
+  return { repo: remote.repo, branch, expectSha: known(newestOnGitHub(git)?.id) ?? null, commits };
+}
+
+// ---------- pull ----------
+
+/** A commit fetched from GitHub: changes relative to its first parent, paths relative to the repo root. */
+export type RemoteCommit = { sha: string; message: string; changes: FileChange[] };
+
+/**
+ * Records fetched GitHub commits as local commits, replayed on top of the
+ * local commit for `baseSha`. Paths go under the remote's folder. The
+ * commits are not on a branch yet; returns the new tip to merge.
+ */
+export function replayRemote(git: GitState, baseSha: string, fetched: RemoteCommit[], time: string): { git: GitState; tip: string } | string {
+  const remote = git.remote;
+  if (!remote) return "no remote";
+  const baseId = Object.entries(remote.shas).find(([, sha]) => sha === baseSha)?.[0];
+  const base = byId(git, baseId);
+  if (!base) return "the last commit known to be on GitHub is no longer in local history; clone again";
+  const prefix = remote.dir ? `${remote.dir}/` : "";
+  const blobs = { ...(git.blobs ?? {}) };
+  const shas = { ...remote.shas };
+  let commits = [...git.commits];
+  let parent = base;
+  for (const item of fetched) {
+    const tree: Tree = { ...(parent.tree ?? {}) };
+    for (const change of item.changes) {
+      const path = `${prefix}${change.path}`;
+      if (change.content === null) delete tree[path];
+      else {
+        const id = hash(change.content);
+        blobs[id] = change.content;
+        tree[path] = id;
+      }
+    }
+    const id = hash(`${parent.id}\n${item.sha}`).slice(0, 7);
+    const made: Commit = { id, message: item.message, time, parent: parent.id, tree };
+    if (!commits.some((commit) => commit.id === id)) commits = [made, ...commits];
+    shas[id] = item.sha;
+    parent = made;
+  }
+  return { git: { ...git, blobs, commits, remote: { ...remote, shas } }, tip: parent.id };
 }
 
 /** Records the GitHub shas a push created. */

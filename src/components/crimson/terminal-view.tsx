@@ -43,6 +43,7 @@ export function TerminalView() {
     if (effect.type === "cwd") setCwd(effect.cwd);
     if (effect.type === "git") applyGit(effect.git, effect.changes);
     if (effect.type === "push") void useOs.getState().gitPush();
+    if (effect.type === "pull") void useOs.getState().gitPull();
     if (effect.type === "clone") void cloneRepo(effect.repo);
     if (effect.type === "run") {
       // Save the open editor draft first so the run sees the latest edits.
