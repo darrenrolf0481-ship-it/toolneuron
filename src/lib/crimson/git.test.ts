@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { abortMerge, blob, add, commitFiles, historyComplete, localIdOf, pullSnapshot, treeParentOf, applyChanges, collect, commit, createBranch, diffText, EMPTY_GIT, findCommit, hash, history, init, markPushed, MAX_COMMITS, merge3, mergeBlockers, mergeBranch, mergeTrees, normalizeGit, pathOf, pushPlan, setRemote, status, subtree, switchBranch, unstage, workingFiles } from "./git.ts";
+import { abortMerge, blob, add, untrackedCollisions, commitFiles, historyComplete, localIdOf, pullSnapshot, treeParentOf, applyChanges, collect, commit, createBranch, diffText, EMPTY_GIT, findCommit, hash, history, init, markPushed, MAX_COMMITS, merge3, mergeBlockers, mergeBranch, mergeTrees, normalizeGit, pathOf, pushPlan, setRemote, status, subtree, switchBranch, unstage, workingFiles } from "./git.ts";
 import type { ProjectFile } from "./types.ts";
 
 const files: ProjectFile[] = [
@@ -335,5 +335,28 @@ describe("history safety", () => {
     assert.deepEqual(Object.keys(done.commits[0].tree!).sort(), ["a.txt", "repo/x.txt"]);
     assert.equal(blob(done, done.commits[0].tree!["a.txt"]), "1", "the staged edit is not in the clone commit");
     assert.equal(blob(done, done.index!["a.txt"]), "staged edit", "and stays staged");
+  });
+});
+
+describe("untracked files are never overwritten (E2)", () => {
+  // main: a.txt. feature adds notes.txt. On main the user writes an untracked notes.txt.
+  const base = commit(add(init(EMPTY_GIT), { "a.txt": "1" }, ["."]).git, "base", "t0")!;
+  const onFeature = commit(add({ ...(createBranch(base, "feature") as typeof base), branch: "feature" }, { "a.txt": "1", "notes.txt": "feature's notes" }, ["."]).git, "notes", "t1")!;
+  const main = (switchBranch(onFeature, { "a.txt": "1", "notes.txt": "feature's notes" }, "main") as { git: typeof base }).git;
+  const mine = { "a.txt": "1", "notes.txt": "MY NOTES" };
+  it("switch refuses and names the file", () => {
+    assert.match(switchBranch(main, mine, "feature") as string, /untracked file\(s\) would be overwritten: notes\.txt/);
+  });
+  it("fast-forward merge refuses", () => {
+    assert.match(mergeBranch(main, mine, "feature", "t2") as string, /would be overwritten: notes\.txt/);
+  });
+  it("three-way merge (and so pull) refuses", () => {
+    const diverged = commit(add(main, { "a.txt": "2" }, ["a.txt"]).git, "main work", "t2")!;
+    assert.match(mergeBranch(diverged, { "a.txt": "2", "notes.txt": "MY NOTES" }, "feature", "t3") as string, /would be overwritten: notes\.txt/);
+  });
+  it("identical untracked contents are adopted, and unrelated untracked files are fine", () => {
+    assert.ok(typeof switchBranch(main, { "a.txt": "1", "notes.txt": "feature's notes" }, "feature") !== "string");
+    assert.ok(typeof switchBranch(main, { "a.txt": "1", "scratch.txt": "mine" }, "feature") !== "string");
+    assert.deepEqual(untrackedCollisions(main, mine, [{ path: "notes.txt", content: null }]), ["notes.txt"]);
   });
 });

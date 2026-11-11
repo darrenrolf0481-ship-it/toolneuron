@@ -320,6 +320,21 @@ export function treeChanges(git: GitState, from: Tree, to: Tree): FileChange[] {
   return compareTrees(from, to).map((change) => ({ path: change.path, content: change.kind === "deleted" ? null : (blob(git, to[change.path]) ?? "") }));
 }
 
+/**
+ * Untracked working files an operation would overwrite or delete: the path
+ * exists in the working files, the index does not track it, and the
+ * operation would leave different contents there (identical contents are
+ * simply adopted, as git does). Real git refuses in this case too.
+ */
+export function untrackedCollisions(git: GitState, work: Record<string, string>, changes: FileChange[]): string[] {
+  const index = git.index ?? {};
+  return changes.filter((change) => change.path in work && !(change.path in index) && change.content !== work[change.path]).map((change) => change.path);
+}
+
+function collisionError(paths: string[]): string {
+  return `untracked file(s) would be overwritten: ${paths.slice(0, 5).join(", ")}${paths.length > 5 ? ", …" : ""}. Add and commit them, or move them away, first`;
+}
+
 /** Uncommitted work that switching or merging would overwrite: staged changes and edits to tracked files. */
 export function dirty(git: GitState, work: Record<string, string>): string[] {
   if (git.merging) return ["(a merge is in progress: commit it or git merge --abort)"];
@@ -356,7 +371,10 @@ export function switchBranch(git: GitState, work: Record<string, string>, name: 
   const pending = dirty(git, work);
   if (pending.length) return `commit or restore your changes first: ${pending.slice(0, 5).join(", ")}${pending.length > 5 ? ", …" : ""}`;
   const target = byId(git, branches[name])?.tree ?? {};
-  return { git: { ...git, branch: name, index: { ...target } }, changes: treeChanges(git, headTree(git), target) };
+  const changes = treeChanges(git, headTree(git), target);
+  const collisions = untrackedCollisions(git, work, changes);
+  if (collisions.length) return collisionError(collisions);
+  return { git: { ...git, branch: name, index: { ...target } }, changes };
 }
 
 /**
@@ -382,9 +400,12 @@ export function mergeInto(git: GitState, work: Record<string, string>, theirs: s
   if (pending.length) return `commit or restore your changes first: ${pending.slice(0, 5).join(", ")}${pending.length > 5 ? ", …" : ""}`;
   const target = byId(git, theirs)?.tree ?? {};
   if (isAncestor(git, ours, theirs)) {
+    const changes = treeChanges(git, headTree(git), target);
+    const collisions = untrackedCollisions(git, work, changes);
+    if (collisions.length) return collisionError(collisions);
     return {
       git: { ...git, branches: { ...branches, [git.branch]: theirs }, index: { ...target } },
-      changes: treeChanges(git, headTree(git), target),
+      changes,
       note: `Fast-forward ${ours ?? "(empty)"}..${theirs}`,
       conflicts: [],
     };
@@ -395,6 +416,8 @@ export function mergeInto(git: GitState, work: Record<string, string>, theirs: s
     return "these histories share an ancestor that is no longer stored (old commits were trimmed), so they cannot be merged safely";
   }
   const merged = mergeTrees(git, base?.tree ?? {}, headTree(git), target);
+  const collisions = untrackedCollisions(git, work, merged.changes);
+  if (collisions.length) return collisionError(collisions);
   const blobs = { ...(git.blobs ?? {}), ...merged.blobs };
   const index = { ...merged.clean };
   const touched = merged.changes.map((change) => change.path);

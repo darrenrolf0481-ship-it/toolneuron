@@ -219,6 +219,22 @@ describe("git merge with conflicts", () => {
   });
 });
 
+describe("untracked files in the terminal", () => {
+  it("git switch refuses to overwrite an untracked file and leaves it as it was", () => {
+    const s = session(["git init", "git add .", 'git commit -m "base"', "git switch -c other"]);
+    const withNew = applyChanges(s.files, [{ path: "notes.txt", content: "other's notes" }], (n) => `n${n}`, () => "text");
+    let state = (interpret("git add notes.txt", { cwd: `${ROOT}/project`, files: withNew, git: s.state }).effect as Extract<TermEffect, { type: "git" }>).git;
+    state = (interpret('git commit -m "notes"', { cwd: `${ROOT}/project`, files: withNew, git: state }).effect as Extract<TermEffect, { type: "git" }>).git;
+    const back = interpret("git switch main", { cwd: `${ROOT}/project`, files: withNew, git: state });
+    state = (back.effect as Extract<TermEffect, { type: "git" }>).git;
+    const onMain = applyChanges(withNew, (back.effect as Extract<TermEffect, { type: "git" }>).changes ?? [], (n) => `m${n}`, () => "text");
+    const mine = onMain.concat({ id: "mine", name: "notes.txt", type: "file", parentId: "root", content: "MY NOTES" });
+    const refused = interpret("git switch other", { cwd: `${ROOT}/project`, files: mine, git: state });
+    assert.match(refused.lines[0], /untracked file\(s\) would be overwritten: notes\.txt/);
+    assert.equal(refused.effect, undefined);
+  });
+});
+
 describe("git remote and push", () => {
   it("adds a remote for a folder and plans a push", () => {
     const s = session(["git init", "git remote add origin me/site src", "git add .", 'git commit -m "first"', "git remote", "git push"]);
