@@ -23,38 +23,96 @@ const DIFF_MAX_LINES = 400;
 export const EMPTY_GIT: GitState = { initialized: false, branch: "main", staged: [], commits: [], index: {}, blobs: {}, branches: { main: undefined } };
 
 /** Fills fields that older saves lack. */
+/**
+ * How a commit id is shown. Ids are the full 14-hex-digit hash (older
+ * commits have 7); the first 7 are shown, and any unique prefix of 4 or
+ * more finds a commit.
+ */
+export function shortId(id: string | undefined): string {
+  return (id ?? "").slice(0, 7);
+}
+
+const isObject = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+const str = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
+/** Keeps only string → string entries. */
+function stringMap(value: unknown): Record<string, string> {
+  if (!isObject(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+}
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+/**
+ * Fills fields that older saves lack, and drops anything malformed (from a
+ * corrupt save or a hand-edited backup) instead of letting it crash later:
+ * commits need an id and a message, trees and maps keep only string values,
+ * branches and parents must point at stored commits, a merge state needs
+ * its lists.
+ */
 export function normalizeGit(raw: unknown): GitState {
-  const git = (raw && typeof raw === "object" ? raw : {}) as Partial<GitState>;
-  const commits = Array.isArray(git.commits) ? git.commits.filter((c) => c && typeof c.id === "string") : [];
-  const branch = typeof git.branch === "string" && git.branch ? git.branch : "main";
+  const git = (isObject(raw) ? raw : {}) as Record<string, unknown>;
+  const commits: Commit[] = (Array.isArray(git.commits) ? git.commits : []).flatMap((item) => {
+    if (!isObject(item) || !str(item.id) || typeof item.message !== "string") return [];
+    const commit: Commit = { id: item.id as string, message: item.message, time: str(item.time) ?? "" };
+    if (str(item.parent)) commit.parent = item.parent as string;
+    if (str(item.parent2)) commit.parent2 = item.parent2 as string;
+    if (isObject(item.tree)) commit.tree = stringMap(item.tree);
+    return [commit];
+  });
+  const ids = new Set(commits.map((commit) => commit.id));
+  const branch = str(git.branch) || "main";
   // Saves from before branches existed: the one branch points at the newest commit.
-  const branches = git.branches && typeof git.branches === "object" ? { ...git.branches } : { [branch]: commits[0]?.id };
+  const rawBranches = isObject(git.branches) ? git.branches : { [branch]: commits[0]?.id };
+  const branches: Record<string, string | undefined> = {};
+  for (const [name, id] of Object.entries(rawBranches)) {
+    if (!BRANCH_NAME.test(name)) continue;
+    branches[name] = typeof id === "string" && ids.has(id) ? id : undefined;
+  }
   if (!(branch in branches)) branches[branch] = undefined;
   const head = commits.find((commit) => commit.id === branches[branch]);
-  let remote =
-    git.remote && typeof git.remote.repo === "string"
-      ? { ...git.remote, dir: git.remote.dir ?? "", track: git.remote.track ?? {}, shas: git.remote.shas ?? {} }
+  const rawRemote = isObject(git.remote) ? git.remote : undefined;
+  let remote: Remote | undefined =
+    rawRemote && str(rawRemote.repo)
+      ? {
+          repo: rawRemote.repo as string,
+          dir: str(rawRemote.dir) ?? "",
+          track: stringMap(rawRemote.track),
+          shas: stringMap(rawRemote.shas),
+          ...(isObject(rawRemote.tips) ? { tips: stringMap(rawRemote.tips) } : {}),
+        }
       : undefined;
   if (remote && !remote.tips) {
     // Saves from before tips were tracked: the best guess is the newest GitHub commit each tracked branch reaches.
     const tips: Record<string, string> = {};
-    const partial = { ...(git as GitState), commits, branches, remote } as GitState;
+    const partial = { initialized: true, branch, staged: [], commits, branches, remote } as GitState;
     for (const [local, remoteBranch] of Object.entries(remote.track)) {
       const found = history(partial, branches[local]).find((commit) => remote!.shas[commit.id]);
       if (found) tips[remoteBranch] = remote.shas[found.id];
     }
     remote = { ...remote, tips };
   }
+  const rawMerging = isObject(git.merging) ? git.merging : undefined;
+  const merging: Merging | undefined =
+    rawMerging && str(rawMerging.theirs) && ids.has(rawMerging.theirs as string)
+      ? {
+          theirs: rawMerging.theirs as string,
+          message: str(rawMerging.message) ?? "Merge",
+          unresolved: stringList(rawMerging.unresolved),
+          conflicts: stringList(rawMerging.conflicts),
+          touched: stringList(rawMerging.touched),
+        }
+      : undefined;
   return {
     initialized: Boolean(git.initialized),
     branch,
     staged: [],
     commits,
-    index: git.index && typeof git.index === "object" ? git.index : { ...(head?.tree ?? {}) },
-    blobs: git.blobs && typeof git.blobs === "object" ? git.blobs : {},
+    index: isObject(git.index) ? stringMap(git.index) : { ...(head?.tree ?? {}) },
+    blobs: stringMap(git.blobs),
     branches,
     ...(remote ? { remote } : {}),
-    ...(git.merging && typeof git.merging.theirs === "string" ? { merging: git.merging } : {}),
+    ...(merging ? { merging } : {}),
   };
 }
 
@@ -234,7 +292,7 @@ export function commit(git: GitState, message: string, time: string): GitState |
   const merging = git.merging;
   if (!merging && compareTrees(headTree(git), index).length === 0) return null;
   const parent = headCommit(git)?.id;
-  const id = hash(`${parent ?? ""}\n${merging?.theirs ?? ""}\n${time}\n${message}\n${JSON.stringify(index)}\n${git.commits.length}`).slice(0, 7);
+  const id = hash(`${parent ?? ""}\n${merging?.theirs ?? ""}\n${time}\n${message}\n${JSON.stringify(index)}\n${git.commits.length}`);
   const branches = { ...(git.branches ?? {}), [git.branch]: id };
   const made: Commit = { id, message, time, parent, ...(merging ? { parent2: merging.theirs } : {}), tree: { ...index } };
   const next = { ...git, branches, commits: [made, ...git.commits] };
@@ -249,7 +307,9 @@ export function mergeBlockers(git: GitState): string[] {
   const out = merging.unresolved.map((path) => `${path}: still conflicted (fix it, then git add ${path})`);
   for (const path of merging.conflicts) {
     const staged = blob(git, git.index?.[path]);
-    if (staged !== undefined && /^(<{7}|>{7}) /m.test(staged)) out.push(`${path}: the staged version still has conflict markers`);
+    // A whole conflict block (the "<<<<<<< ours … >>>>>>> theirs" form or the two-line delete/edit notice),
+    // so a resolved file that keeps one such line on purpose is not blocked.
+    if (staged !== undefined && /^<{7} [\s\S]*^>{7}( |$)/m.test(staged)) out.push(`${path}: the staged version still has conflict markers`);
   }
   return out;
 }
@@ -270,7 +330,7 @@ export function commitFiles(git: GitState, files: Record<string, string>, messag
   }
   const parent = headCommit(git)?.id;
   const tree = { ...headTree(git), ...added };
-  const id = hash(`${parent ?? ""}\n${time}\n${message}\n${JSON.stringify(tree)}\n${git.commits.length}`).slice(0, 7);
+  const id = hash(`${parent ?? ""}\n${time}\n${message}\n${JSON.stringify(tree)}\n${git.commits.length}`);
   const made: Commit = { id, message, time, parent, tree };
   return trim({ ...git, blobs, index: { ...(git.index ?? {}), ...added }, branches: { ...(git.branches ?? {}), [git.branch]: id }, commits: [made, ...git.commits] });
 }
@@ -414,7 +474,7 @@ export function mergeInto(git: GitState, work: Record<string, string>, theirs: s
     return {
       git: { ...git, branches: { ...branches, [git.branch]: theirs }, index: { ...target } },
       changes,
-      note: `Fast-forward ${ours ?? "(empty)"}..${theirs}`,
+      note: `Fast-forward ${ours ? shortId(ours) : "(empty)"}..${shortId(theirs)}`,
       conflicts: [],
     };
   }
@@ -551,7 +611,8 @@ export function merge3(base: string | undefined, ours: string, theirs: string): 
     const region = [all[k]];
     let end = all[k].end;
     k++;
-    while (k < all.length && (all[k].start < end || all[k].start === region[region.length - 1].start)) {
+    // Like git, hunks that touch (one ends where the other starts) are resolved together, so edits to adjacent lines conflict.
+    while (k < all.length && (all[k].start <= end || all[k].start === region[region.length - 1].start)) {
       region.push(all[k]);
       end = Math.max(end, all[k].end);
       k++;
@@ -713,7 +774,7 @@ export function pushPlan(git: GitState): PushPlan | string {
     const parentIds = [commit.parent, commit.parent2].filter((id): id is string => Boolean(id));
     const treeParent = treeParentOf(git, parentIds);
     if (treeParent === null) {
-      return `merge ${commit.id} joins two sides that each have GitHub commits the other lacks; push one side first, or pull and merge again`;
+      return `merge ${shortId(commit.id)} joins two sides that each have GitHub commits the other lacks; push one side first, or pull and merge again`;
     }
     const parents: PushParent[] = parentIds.map((id) => (known(id) ? { sha: known(id)! } : { index: position.get(id)! }));
     const before = subtree(byId(git, parentIds[treeParent])?.tree ?? {}, remote.dir);
@@ -881,6 +942,33 @@ export function diffText(path: string, before: string | undefined, after: string
 }
 
 // ---------- applying changes to project files ----------
+
+/**
+ * Paths a set of changes cannot be applied to because a file is where a
+ * folder must go (a/b.txt with a FILE named a) or a folder is where a file
+ * must go. The operation must be refused, leaving the project unchanged.
+ */
+export function pathClashes(files: ProjectFile[], changes: FileChange[]): string[] {
+  const roots = files.filter((item) => item.parentId === null);
+  const projectRoot = roots.length === 1 && roots[0].type === "folder" ? roots[0].id : null;
+  const out: string[] = [];
+  for (const change of changes) {
+    if (change.content === null) continue;
+    const parts = change.path.split("/");
+    let parentId: string | null = projectRoot;
+    for (let index = 0; index < parts.length; index++) {
+      const item = files.find((file) => file.parentId === parentId && file.name === parts[index]);
+      if (!item) break; // the rest will be created
+      const last = index === parts.length - 1;
+      if (last ? item.type === "folder" : item.type === "file") {
+        out.push(change.path);
+        break;
+      }
+      parentId = item.id;
+    }
+  }
+  return out;
+}
 
 /**
  * Applies path-based changes to the project's file list: updates contents,

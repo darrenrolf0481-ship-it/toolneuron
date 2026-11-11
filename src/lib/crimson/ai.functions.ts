@@ -63,7 +63,8 @@ export const askCrimson = createServerFn({ method: "POST" })
         };
       }
       failures.push(attempt.error);
-      if (attempt.timedOut) break;
+      // A model that thought its whole budget away answered; falling back would only repeat it.
+      if (attempt.timedOut || attempt.final) break;
     }
     return { ok: false as const, error: failures.join(" ") };
   });
@@ -73,7 +74,7 @@ async function completeOnce(
   provider: ProviderConfig,
   data: ReturnType<typeof normalizeChatInput>,
   caps: { fast: number; precise: number },
-): Promise<{ ok: true; text: string; model?: string } | { ok: false; error: string; timedOut?: boolean }> {
+): Promise<{ ok: true; text: string; model?: string } | { ok: false; error: string; timedOut?: boolean; final?: boolean }> {
   const headers: Record<string, string> = { "Content-Type": "application/json", ...provider.headers };
   if (provider.apiKey) headers.Authorization = `Bearer ${provider.apiKey}`;
   let response: Response;
@@ -102,6 +103,7 @@ async function completeOnce(
     return {
       ok: false,
       error: body.choices?.[0]?.finish_reason === "length" ? `${provider.label} spent its whole token budget thinking and wrote no answer.` : `${provider.label} returned an empty reply.`,
+      final: body.choices?.[0]?.finish_reason === "length",
     };
   }
   return { ok: true, text, model: body.model };

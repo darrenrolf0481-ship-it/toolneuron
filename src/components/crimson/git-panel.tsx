@@ -82,8 +82,8 @@ export function GitPanel() {
             const result = Git.switchBranch(git, work, event.target.value);
             if (typeof result === "string") setNotice(result);
             else {
-              applyGit(result.git, result.changes);
-              setNotice(`Switched to ${event.target.value}${result.changes.length ? `: ${result.changes.length} file(s) updated` : ""}.`);
+              if (applyGit(result.git, result.changes)) setNotice(`Switched to ${event.target.value}${result.changes.length ? `: ${result.changes.length} file(s) updated` : ""}.`);
+              else setNotice("Not switched: a file and a folder share a name (details in the terminal).");
             }
           }}
           className="min-h-11 rounded-2xl border border-border bg-bg px-3 text-sm"
@@ -116,7 +116,7 @@ export function GitPanel() {
         </form>
       </section>
       <p className="text-sm text-muted">
-        {head ? `Last commit ${head.id}` : "No commits yet"}. History stays in this browser.{" "}
+        {head ? `Last commit ${Git.shortId(head.id)}` : "No commits yet"}. History stays in this browser.{" "}
         {git.remote ? `Pushes project/${git.remote.dir ? `${git.remote.dir}/` : ""} to ${git.remote.repo}.` : "No remote: clone a repo with GITHUB_TOKEN set, or git remote add origin owner/name in the terminal."}
       </p>
       {git.remote && (
@@ -177,8 +177,7 @@ export function GitPanel() {
               const result = Git.abortMerge(git);
               if (typeof result === "string") setNotice(result);
               else {
-                applyGit(result.git, result.changes);
-                setNotice("Merge aborted.");
+                setNotice(applyGit(result.git, result.changes) ? "Merge aborted." : "Not aborted: a file and a folder share a name (details in the terminal).");
               }
             }}
             className="min-h-9 rounded-full border border-border px-3 text-xs"
@@ -250,7 +249,7 @@ export function GitPanel() {
             const onGitHub = git.remote?.shas[commit.id];
             return (
               <li key={commit.id} className="rounded-2xl border border-border bg-surface px-3 py-2 text-sm">
-                <span className="font-mono text-xs text-primary">{commit.id}</span> {commit.message}
+                <span className="font-mono text-xs text-primary">{Git.shortId(commit.id)}</span> {commit.message}
                 <span className="block text-xs text-muted">
                   {commit.time}
                   {changed === null ? " · no snapshot (made before history was real)" : ` · ${changed} file(s)`}

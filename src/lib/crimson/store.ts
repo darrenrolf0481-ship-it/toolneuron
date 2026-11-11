@@ -5,6 +5,7 @@ import { streamChat } from "./stream-chat";
 import { exportVaultBlob, importVaultBlob } from "./vault/vault-store";
 import { findHandoff, formatHandoff, HANDOFF_NAME, stripModeLabel } from "./handoff";
 import * as Git from "./git";
+import { nameProblem } from "./names";
 import { loadGit, openGitDb, requestPersistentStorage, saveGit } from "./git-store";
 import { mergeLines } from "./terminal";
 import {
@@ -98,8 +99,10 @@ export type OsState = {
   openFile: (id: string) => void;
   toggleFolder: (id: string) => void;
   flushDraft: () => void;
-  createItem: (parentId: string, type: "file" | "folder", name: string) => void;
-  renameItem: (id: string, name: string) => void;
+  /** Returns why the name was refused, or null when the item was created. */
+  createItem: (parentId: string, type: "file" | "folder", name: string) => string | null;
+  /** Returns why the name was refused, or null when the item was renamed. */
+  renameItem: (id: string, name: string) => string | null;
   deleteItem: (id: string) => void;
   loadTemplate: (key: string) => void;
   pushTerminal: (lines: string[]) => void;
@@ -113,7 +116,7 @@ export type OsState = {
   gitCommit: (message: string) => boolean;
   /** Sets git state and writes restored contents into existing files. */
   /** Sets git state and applies file changes (restore, checkout, switch, merge). */
-  applyGit: (git: GitState, changes?: Git.FileChange[]) => void;
+  applyGit: (git: GitState, changes?: Git.FileChange[]) => boolean;
   /** Pushes the current branch's unpushed commits to the linked GitHub repo. */
   gitPush: () => Promise<{ ok: boolean; message: string }>;
   /** Fetches new GitHub commits for the current branch and merges them in. */
@@ -300,6 +303,12 @@ export function bootPersistence() {
   });
   void initGitStorage(localHasGit);
   // Never lose the last edits when the tab closes or goes to the background.
+  // Another tab saved this project: stop saving here so neither overwrites the other.
+  window.addEventListener("storage", (event) => {
+    if (event.key !== KEY || event.newValue === null || event.newValue === lastSaved || staleTab) return;
+    staleTab = true;
+    setSaveError("This project was changed in another tab. This tab has stopped saving so it cannot overwrite that work: reload it to continue here.");
+  });
   window.addEventListener("pagehide", () => {
     flushSave();
     stashPendingGit();
@@ -373,7 +382,7 @@ export function flushSave() {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = null;
   const state = useOs.getState();
-  if (!state.booted) return;
+  if (!state.booted || staleTab) return;
   const json = JSON.stringify(persistable(state, false));
   if (json === lastSaved) return;
   try {
@@ -406,6 +415,7 @@ export function importNode(text: string): { ok: true; summary: string } | { ok: 
   const parsed = parseImport(text);
   if (!parsed.ok) return parsed;
   const data = parsed.node;
+  generation++;
   chatAbort?.abort();
   chatAbort = null;
   stopSwarm();
@@ -460,6 +470,7 @@ let gitConfirmed: unknown = null;
 
 /** Writes git history to IndexedDB right away (not debounced: an async write can be lost if the page closes first). */
 function saveGitNow(git: GitState) {
+  if (staleTab) return;
   saveGit(git)
     .then(() => {
       if (useOs.getState().git !== git) return;
@@ -484,7 +495,7 @@ function saveGitNow(git: GitState) {
 /** On hide or close: if IndexedDB has not confirmed the latest history, keep a synchronous copy in localStorage. */
 function stashPendingGit() {
   const state = useOs.getState();
-  if (state.gitStorage !== "indexeddb" || gitConfirmed === state.git) return;
+  if (staleTab || state.gitStorage !== "indexeddb" || gitConfirmed === state.git) return;
   try {
     localStorage.setItem(PENDING_GIT_KEY, JSON.stringify(state.git));
   } catch {
@@ -530,6 +541,11 @@ function persistable(state: OsState, slim: boolean, full = false) {
 
 /** The in-flight chat request, so Stop (and reset) can cancel it. */
 let chatAbort: AbortController | null = null;
+/** Bumped when the workspace is replaced (reset, import), so late replies cannot write into the new one. */
+let generation = 0;
+/** Set when another tab saved this project: this tab stops saving until reloaded. */
+let staleTab = false;
+
 /** The GitHub operation in flight ("push", "pull" or "clone"), so two cannot interleave. */
 let githubBusy: string | null = null;
 
@@ -635,7 +651,8 @@ export const useOs = create<OsState>((set, get) => ({
 
   createItem: (parentId, type, name) => {
     const trimmed = name.trim();
-    if (!trimmed) return;
+    const problem = nameProblem(get().files, parentId, trimmed);
+    if (problem) return problem;
     const id = `f_${Date.now()}`;
     const item: ProjectFile = {
       id,
@@ -650,14 +667,19 @@ export const useOs = create<OsState>((set, get) => ({
     if (type === "file") {
       get().flushDraft();
       set({ files: get().files.concat(item).map((file) => (file.id === parentId ? { ...file, isOpen: true } : file)), activeFileId: id, draft: "" });
-      return;
+      return null;
     }
     set({ files });
+    return null;
   },
 
   renameItem: (id, name) => {
     const trimmed = name.trim();
-    if (!trimmed || id === "root") return;
+    const item = get().files.find((file) => file.id === id);
+    if (!item || id === "root") return null;
+    if (trimmed === item.name) return null;
+    const problem = nameProblem(get().files, item.parentId, trimmed, id);
+    if (problem) return problem;
     set({
       files: get().files.map((file) =>
         file.id === id
@@ -665,6 +687,7 @@ export const useOs = create<OsState>((set, get) => ({
           : file,
       ),
     });
+    return null;
   },
 
   deleteItem: (id) => {
@@ -736,7 +759,13 @@ export const useOs = create<OsState>((set, get) => ({
     const state = get();
     if (changes.length === 0) {
       set({ git });
-      return;
+      return true;
+    }
+    const clashes = Git.pathClashes(state.files, changes);
+    if (clashes.length) {
+      // Leave git and the files exactly as they were.
+      get().pushTerminal([`[ERROR] a file and a folder have the same name, so nothing was changed: ${clashes.slice(0, 5).join(", ")}. Rename one, then try again.`]);
+      return false;
     }
     const stampId = Date.now().toString(36);
     const files = Git.applyChanges(state.files, changes, (n) => `git_${stampId}_${n}`, languageFromName);
@@ -749,6 +778,7 @@ export const useOs = create<OsState>((set, get) => ({
       draft: fallback?.content ?? "",
       workFileId: files.some((file) => file.id === state.workFileId) ? state.workFileId : (fallback?.id ?? ""),
     });
+    return true;
   },
   gitPush: async () => {
     const say = (lines: string[]) => get().pushTerminal(lines);
@@ -834,7 +864,7 @@ export const useOs = create<OsState>((set, get) => ({
     // GitHub's branch is now known to be at the fetched tip.
     const withTip = merged.git.remote ? { ...merged.git, remote: { ...merged.git.remote, tips: { ...(merged.git.remote.tips ?? {}), [branch]: result.tip } } } : merged.git;
     const view = mergeLines(now, { ...merged, git: withTip });
-    get().applyGit(withTip, merged.changes);
+    if (!get().applyGit(withTip, merged.changes)) return fail("the pulled files clash with names in this project (a file and a folder share a name); nothing was applied");
     say([
       `[INFO] Fetched ${result.ahead ?? "?"} commit(s) from GitHub${subjects.length ? `: ${subjects.slice(0, 3).join("; ")}${subjects.length > 3 ? "; …" : ""}` : ""}`,
       ...view.lines,
@@ -963,6 +993,7 @@ export const useOs = create<OsState>((set, get) => ({
     set({ chat: history, busy: true, tab: "toolneuron", module: "chat" });
     try {
       const fileMatch = text.match(/(?:create|generate) (?:a )?(?:new )?file named ([A-Za-z0-9_.-]+)/i);
+      const startedIn = generation;
       // See historyForModel: refused turns, notices and the welcome line are left out.
       const messages = historyForModel(history, activePersonality(get().personalities).name);
       if (fileMatch) {
@@ -993,6 +1024,7 @@ export const useOs = create<OsState>((set, get) => ({
       );
       if (chatAbort === controller) chatAbort = null;
 
+      if (startedIn !== generation) return; // the workspace was reset or replaced while the reply streamed
       if (fileMatch && result.ok) {
         const name = fileMatch[1];
         const id = `gen_${Date.now()}`;
@@ -1095,6 +1127,7 @@ export const useOs = create<OsState>((set, get) => ({
   },
 
   resetNode: () => {
+    generation++;
     chatAbort?.abort();
     chatAbort = null;
     stopSwarm();

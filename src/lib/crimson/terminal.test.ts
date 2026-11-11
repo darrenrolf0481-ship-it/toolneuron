@@ -137,7 +137,7 @@ describe("git branches", () => {
   it("branch, switch, commit, switch back (files follow), fast-forward merge, delete", () => {
     const s = session(["git init", "git add .", 'git commit -m "base"', "git switch -c feature", "git branch"]);
     assert.match(s.out[3][0], /Switched to a new branch 'feature'/);
-    assert.deepEqual(s.out[4], ["* feature  " + s.state.branches!.feature, "  main  " + s.state.branches!.main]);
+    assert.deepEqual(s.out[4], ["* feature  " + s.state.branches!.feature!.slice(0, 7), "  main  " + s.state.branches!.main!.slice(0, 7)]);
     // Commit a change on feature, including a new file.
     let state = s.state;
     let current = applyChanges(s.files, [{ path: "src/main.py", content: "print('feature')" }, { path: "NEW.md", content: "new" }], (n) => `n${n}`, () => "text");

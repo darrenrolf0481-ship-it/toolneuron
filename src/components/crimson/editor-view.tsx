@@ -192,7 +192,13 @@ function TreeNode({ id, depth, onPick }: { id: string; depth: number; onPick: ()
   const [name, setName] = useState(node?.name ?? "");
   const [creating, setCreating] = useState<"file" | "folder" | null>(null);
   const [draftName, setDraftName] = useState("");
+  const [nameError, setNameError] = useState<string | null>(null);
   if (!node) return null;
+  const commitRename = () => {
+    const problem = renameItem(id, name);
+    setNameError(problem);
+    if (!problem) setRenaming(false);
+  };
   const children = files.filter((file) => file.parentId === id);
 
   return (
@@ -207,15 +213,21 @@ function TreeNode({ id, depth, onPick }: { id: string; depth: number; onPick: ()
             value={name}
             onChange={(event) => setName(event.target.value)}
             onBlur={() => {
-              renameItem(id, name);
+              // Leaving the field with a bad name discards the edit instead of trapping focus.
+              if (renameItem(id, name)) setName(node.name);
+              setNameError(null);
               setRenaming(false);
             }}
             onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                renameItem(id, name);
+              if (event.key === "Enter") commitRename();
+              if (event.key === "Escape") {
+                setName(node.name);
+                setNameError(null);
                 setRenaming(false);
               }
             }}
+            aria-invalid={nameError ? true : undefined}
+            aria-label={`Rename ${node.name}`}
             className="min-h-11 w-full bg-transparent text-sm outline-none"
           />
         ) : (
@@ -268,7 +280,9 @@ function TreeNode({ id, depth, onPick }: { id: string; depth: number; onPick: ()
           style={{ paddingLeft: `${depth * 12 + 28}px` }}
           onSubmit={(event) => {
             event.preventDefault();
-            createItem(id, creating, draftName);
+            const problem = createItem(id, creating, draftName);
+            setNameError(problem);
+            if (problem) return;
             setDraftName("");
             setCreating(null);
           }}
@@ -278,9 +292,16 @@ function TreeNode({ id, depth, onPick }: { id: string; depth: number; onPick: ()
             value={draftName}
             onChange={(event) => setDraftName(event.target.value)}
             placeholder={creating === "file" ? "file.py" : "folder"}
+            aria-label={creating === "file" ? "New file name" : "New folder name"}
+            aria-invalid={nameError ? true : undefined}
             className="min-h-11 w-full rounded-xl border border-border bg-bg px-2 text-sm outline-none"
           />
         </form>
+      )}
+      {nameError && (renaming || creating) && (
+        <p role="alert" className="px-3 pb-1 text-xs text-primary" style={{ paddingLeft: `${depth * 12 + 28}px` }}>
+          {nameError}
+        </p>
       )}
       {node.type === "folder" && node.isOpen && children.map((child: ProjectFile) => (
         <TreeNode key={child.id} id={child.id} depth={depth + 1} onPick={onPick} />

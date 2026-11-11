@@ -76,37 +76,82 @@ export function systemPrompt(state: PromptState, message: string): { prompt: str
   // While the handoff note is open, the code being worked on is still the last other file.
   const noteOpen = Boolean(open && open.id === note?.id);
   const file = noteOpen ? state.files.find((item) => item.id === state.workFileId && item.type === "file" && item.id !== note?.id) : open;
-  const fileText = file ? (file.id === state.activeFileId ? state.draft || file.content || "" : file.content || "") : "";
+  // The open file's live draft, even when the user emptied it.
+  const fileText = file ? (file.id === state.activeFileId ? state.draft : (file.content ?? "")) : "";
   const knowledge = knowledgeBlock(retrieve(state.packs, message));
   const skills = pickSkills(persona?.skills, message);
-  const head = [
-    persona?.instruction ?? "",
-    BASE_RULES,
-    skillsBlock(skills).slice(0, 1600),
-    handoffBlock(handoffText(state)),
-    knowledge,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-  const room = Math.max(0, PROMPT_BUDGET - head.length - 40);
   const label = noteOpen ? `Working file ${file?.name} (the user has ${HANDOFF_NAME} open in the editor)` : `Open file ${file?.name}`;
-  const code = file && room > 200 ? `${label}:\n${fileText.slice(0, room)}` : "";
-  return { prompt: [head, code].filter(Boolean).join("\n\n"), skills: skills.map((skill) => skill.name) };
+  // Reserve room for the file first, then fit the other sections into what is left.
+  const fileWant = file ? label.length + 2 + fileText.length : 0;
+  const fileFloor = Math.min(fileWant, FILE_FLOOR);
+  const head = fitSections(
+    [
+      { text: persona?.instruction ?? "", min: 600 },
+      { text: BASE_RULES, min: BASE_RULES.length },
+      { text: skillsBlock(skills).slice(0, 1600), min: 700 },
+      { text: handoffBlock(handoffText(state)), min: 800 },
+      { text: knowledge, min: 0 },
+    ],
+    PROMPT_BUDGET - fileFloor - 4,
+  );
+  const room = PROMPT_BUDGET - head.length - 4 - label.length - 2;
+  const code = file ? `${label}:\n${clipFile(fileText, room)}` : "";
+  const prompt = [head, code].filter(Boolean).join("\n\n");
+  return { prompt: prompt.slice(0, PROMPT_BUDGET), skills: skills.map((skill) => skill.name) };
+}
+
+/** Room always kept for the open file (when it is that long). */
+export const FILE_FLOOR = 2000;
+const CUT = "\n[…cut to fit]";
+
+/**
+ * Joins sections with blank lines within `budget` characters. When they do
+ * not fit, sections are shortened from the LAST one backwards (knowledge,
+ * then the handoff note, then skills, then the persona), never below their
+ * `min`, each cut marked; the result is then hard-capped.
+ */
+export function fitSections(sections: { text: string; min: number }[], budget: number): string {
+  const parts = sections.map((section) => ({ ...section, text: section.text.trim() })).filter((section) => section.text);
+  const total = () => parts.reduce((sum, part) => sum + part.text.length, 0) + Math.max(0, parts.length - 1) * 2;
+  for (let index = parts.length - 1; index >= 0 && total() > budget; index--) {
+    const part = parts[index];
+    const over = total() - budget;
+    const target = Math.max(part.min, part.text.length - over - CUT.length);
+    if (target < part.text.length) part.text = target <= 0 ? "" : part.text.slice(0, target) + CUT;
+  }
+  return parts
+    .filter((part) => part.text)
+    .map((part) => part.text)
+    .join("\n\n")
+    .slice(0, Math.max(0, budget));
+}
+
+/** The file text within `room` characters, cut at a line end with a note saying how much was left out. */
+export function clipFile(text: string, room: number): string {
+  if (text.length <= room) return text;
+  const lines = text.split("\n").length;
+  const keep = Math.max(0, room - 80);
+  const cutAt = text.lastIndexOf("\n", keep);
+  const shown = text.slice(0, cutAt > 0 ? cutAt : keep);
+  const shownLines = shown.split("\n").length;
+  return `${shown}\n[file cut to fit: first ${shownLines} of ${lines} lines shown]`;
 }
 
 /** System prompt for the terminal's `ai` command: one skill, a short note, a short answer. */
 export function terminalPrompt(state: PromptState, question: string, cwd: string): { prompt: string; skills: string[] } {
   const persona = activePersonality(state.personalities);
   const skills = pickSkills(persona?.skills, question, 1);
-  const prompt = [
-    persona?.instruction ?? "",
-    skillsBlock(skills),
-    handoffBlock(handoffText(state), 1200),
-    `Reply as a terminal specialist in under 80 words. Current directory ${cwd}.`,
-  ]
-    .filter(Boolean)
-    .join("\n");
-  return { prompt, skills: skills.map((skill) => skill.name) };
+  const tail = `Reply as a terminal specialist in under 80 words. Current directory ${cwd}.`;
+  // The instruction goes last and must survive, so the rest is fitted around it.
+  const head = fitSections(
+    [
+      { text: persona?.instruction ?? "", min: 600 },
+      { text: skillsBlock(skills), min: 400 },
+      { text: handoffBlock(handoffText(state), 1200), min: 0 },
+    ],
+    PROMPT_BUDGET - tail.length - 2,
+  );
+  return { prompt: [head, tail].filter(Boolean).join("\n"), skills: skills.map((skill) => skill.name) };
 }
 
 /**

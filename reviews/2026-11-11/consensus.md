@@ -27,3 +27,21 @@ Reviewers: Grok Build (grok-4.7, xhigh), Kimi Code (K3.1 Pro), Antigravity (Clau
 3. Untracked-file guard (P5).
 4. IndexedDB for graph and blobs, then full history retention (P6).
 5. The rest of P8 and P9.
+
+## Status (2026-11-11)
+All five steps are implemented:
+- Steps 1 and 2 (allowlist, modes, lockout, snapshot pull, tree-parent push, per-branch tips, pinned operations): commit a050342. Live-tested on a private repo (E1, E3, E4).
+- Step 3 (untracked files are never overwritten): 7ae4cad.
+- Step 4 (git history in IndexedDB, no commit cap, a synchronous copy kept on page close): 4458dc8.
+- Step 5 (smaller fixes):
+  - adjacent-line edits conflict (merge3 now agrees with `git merge-file` on 12,000 fuzzed cases);
+  - whole-prompt budget with cut markers;
+  - an emptied draft is sent as empty;
+  - the stream reader requires a `done` event;
+  - names validated and file/folder clashes refused;
+  - imported git validated;
+  - two-tab protection;
+  - no fallback after a model thinks its budget away;
+  - late replies cannot write into a reset workspace;
+  - the conflict-marker check takes both formats;
+  - full-length commit ids.

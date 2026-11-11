@@ -7,6 +7,7 @@ import {
   OLD_WELCOME,
   pickWorkFile,
   PROMPT_BUDGET,
+  FILE_FLOOR,
   systemPrompt,
   terminalPrompt,
   upgradeWelcome,
@@ -60,6 +61,28 @@ describe("systemPrompt", () => {
     assert.ok(prompt.length <= PROMPT_BUDGET, String(prompt.length));
     assert.ok(prompt.includes("Open file app.py:"));
   });
+  it("an emptied editor is sent as empty, not as the old saved text", () => {
+    const { prompt } = systemPrompt(state({ draft: "" }), "what is left?");
+    assert.ok(prompt.endsWith("Open file app.py:\n"), JSON.stringify(prompt.slice(-60)));
+    assert.ok(!prompt.includes("sum(xs)"));
+  });
+  it("a long file is cut at a line end and says so", () => {
+    const big = { ...code, content: Array.from({ length: 900 }, (_, i) => `line_${i} = ${i}`).join("\n") };
+    const { prompt } = systemPrompt(state({ files: [root, big], draft: big.content }), "review");
+    assert.ok(prompt.length <= PROMPT_BUDGET);
+    assert.match(prompt, /\n\[file cut to fit: first \d+ of 900 lines shown\]$/);
+  });
+  it("oversized sections shrink, newest-priority first, and the file keeps its floor", () => {
+    const longPersona = { ...syntax, instruction: "P".repeat(4000) };
+    const longNote = { ...note, content: formatHandoff("Architect", "N".repeat(5000), new Date()) };
+    const big = { ...code, content: "x = 1\n".repeat(3000) };
+    const { prompt } = systemPrompt(state({ personalities: [longPersona], files: [root, big, longNote], draft: big.content }), "review");
+    assert.ok(prompt.length <= PROMPT_BUDGET, String(prompt.length));
+    assert.ok(prompt.includes(BASE_RULES), "the base rules are never cut");
+    assert.match(prompt, /\[…cut to fit\]/);
+    const fileShown = prompt.slice(prompt.indexOf("Open file app.py:\n") + "Open file app.py:\n".length);
+    assert.ok(fileShown.length >= FILE_FLOOR - 120, `file got ${fileShown.length} chars`);
+  });
   it("works with no open file", () => {
     const { prompt } = systemPrompt(state({ activeFileId: "", workFileId: "" }), "hi");
     assert.ok(!prompt.includes("Open file"));
@@ -67,6 +90,11 @@ describe("systemPrompt", () => {
 });
 
 describe("terminalPrompt", () => {
+  it("keeps the terminal instruction even with a huge persona", () => {
+    const { prompt } = terminalPrompt(state({ personalities: [{ ...syntax, instruction: "P".repeat(9000) }] }), "ls?", "~/p");
+    assert.ok(prompt.length <= PROMPT_BUDGET);
+    assert.ok(prompt.endsWith("Current directory ~/p."));
+  });
   it("uses one skill, a shorter note and the cwd", () => {
     const { prompt, skills } = terminalPrompt(state({ files: [root, code, { ...note, content: formatHandoff("Oracle", "y".repeat(5000), new Date()) }] }), "write a unit test", "~/project");
     assert.equal(skills.length, 1);

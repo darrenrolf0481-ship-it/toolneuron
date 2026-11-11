@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { abortMerge, blob, add, untrackedCollisions, commitFiles, historyComplete, localIdOf, pullSnapshot, treeParentOf, applyChanges, collect, commit, createBranch, diffText, EMPTY_GIT, findCommit, hash, history, init, markPushed, merge3, mergeBlockers, mergeBranch, mergeTrees, normalizeGit, pathOf, pushPlan, setRemote, status, subtree, switchBranch, unstage, workingFiles } from "./git.ts";
+import { abortMerge, blob, add, pathClashes, shortId, untrackedCollisions, commitFiles, historyComplete, localIdOf, pullSnapshot, treeParentOf, applyChanges, collect, commit, createBranch, diffText, EMPTY_GIT, findCommit, hash, history, init, markPushed, merge3, mergeBlockers, mergeBranch, mergeTrees, normalizeGit, pathOf, pushPlan, setRemote, status, subtree, switchBranch, unstage, workingFiles } from "./git.ts";
 import type { ProjectFile } from "./types.ts";
 
 const files: ProjectFile[] = [
@@ -35,7 +35,7 @@ describe("add, commit, status", () => {
     assert.deepEqual(status(g1, work).staged.map((c) => c.kind), ["added", "added"]);
     const g2 = commit(g1, "first", "10:00:00")!;
     assert.equal(g2.commits.length, 1);
-    assert.equal(g2.commits[0].id.length, 7);
+    assert.equal(g2.commits[0].id.length, 14, "full-length ids (shown as 7)");
     assert.deepEqual(status(g2, work), { staged: [], unstaged: [], untracked: [] });
     assert.equal(commit(g2, "again", "10:01:00"), null, "nothing to commit");
   });
@@ -149,6 +149,9 @@ describe("applyChanges", () => {
 
 describe("merge3", () => {
   const base = "a\nb\nc\nd\ne";
+  it("edits to adjacent lines conflict, like git", () => {
+    assert.equal(merge3("a\nb\nc\n", "a\nB\nc\n", "a\nb\nC\n").conflict, true);
+  });
   it("applies changes to different lines from both sides", () => {
     assert.deepEqual(merge3(base, "A\nb\nc\nd\ne", "a\nb\nc\nd\nE"), { text: "A\nb\nc\nd\nE", conflict: false });
     assert.deepEqual(merge3(base, "a\nb\nX\nc\nd\ne", "a\nb\nc\nd\ne\nf"), { text: "a\nb\nX\nc\nd\ne\nf", conflict: false });
@@ -376,5 +379,46 @@ describe("untracked files are never overwritten (E2)", () => {
     assert.ok(typeof switchBranch(main, { "a.txt": "1", "notes.txt": "feature's notes" }, "feature") !== "string");
     assert.ok(typeof switchBranch(main, { "a.txt": "1", "scratch.txt": "mine" }, "feature") !== "string");
     assert.deepEqual(untrackedCollisions(main, mine, [{ path: "notes.txt", content: null }]), ["notes.txt"]);
+  });
+});
+
+describe("step 5 safety checks", () => {
+  it("the marker check needs a whole conflict block, in either format the app writes", () => {
+    const base = commit(add(init(EMPTY_GIT), { "f.md": "x" }, ["."]).git, "base", "t0")!;
+    const merging = { ...base, merging: { theirs: base.branches!.main!, message: "m", unresolved: [], conflicts: ["f.md"], touched: [] } };
+    const staged = (text: string) => mergeBlockers(add(merging, { "f.md": text }, ["f.md"]).git);
+    assert.deepEqual(staged("> quote\n>>>>>>> not a block on its own"), []);
+    assert.equal(staged("<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs").length, 1);
+    assert.equal(staged("<<<<<<< CONFLICT: deleted here, changed on the other side. Keep…\n>>>>>>> \nkept").length, 1);
+  });
+  it("malformed saved git data is dropped, not crashed on", () => {
+    const g = normalizeGit({
+      initialized: true,
+      branch: "main",
+      commits: [{ id: "good", message: "ok", time: "t", tree: { "a.txt": "h", bad: 5 } }, { id: 7 }, { message: "no id" }],
+      branches: { main: "good", "bad..name": "good", ghost: "missing" },
+      merging: { theirs: "x", unresolved: null },
+      index: { "a.txt": "h", nope: [] },
+      blobs: { h: "a", n: 1 },
+      remote: { repo: "me/r", shas: { good: "s", bad: {} } },
+    });
+    assert.deepEqual(g.commits.map((c) => c.id), ["good"]);
+    assert.deepEqual(g.commits[0].tree, { "a.txt": "h" });
+    assert.deepEqual(g.branches, { main: "good", ghost: undefined });
+    assert.equal(g.merging, undefined, "a merge state pointing at nothing is dropped");
+    assert.deepEqual(g.index, { "a.txt": "h" });
+    assert.deepEqual(g.blobs, { h: "a" });
+    assert.deepEqual(g.remote!.shas, { good: "s" });
+  });
+  it("pathClashes finds a file where a folder must go, and a folder where a file must go", () => {
+    const files = [
+      { id: "root", name: "P", type: "folder" as const, parentId: null },
+      { id: "docs", name: "docs", type: "file" as const, parentId: "root", content: "" },
+      { id: "src", name: "src", type: "folder" as const, parentId: "root" },
+    ];
+    assert.deepEqual(pathClashes(files, [{ path: "docs/guide.md", content: "x" }, { path: "src", content: "x" }, { path: "src/ok.ts", content: "x" }, { path: "docs", content: null }]), ["docs/guide.md", "src"]);
+  });
+  it("shows commit ids as 7 characters", () => {
+    assert.equal(shortId("0123456789abcd"), "0123456");
   });
 });

@@ -277,7 +277,7 @@ function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffe
   if (sub === "status") {
     const state = Git.status(repo, work());
     const head = Git.headCommit(repo);
-    const lines = [`On branch ${repo.branch}${head ? `, last commit ${head.id} ${head.message}` : ", no commits yet"}`];
+    const lines = [`On branch ${repo.branch}${head ? `, last commit ${Git.shortId(head.id)} ${head.message}` : ", no commits yet"}`];
     if (repo.merging) {
       lines.push(`Merging (${repo.merging.message}).`);
       if (repo.merging.unresolved.length) lines.push("Unmerged paths (fix the markers, then git add <path>):", ...repo.merging.unresolved.map((path) => `  both modified: ${path}`));
@@ -311,7 +311,7 @@ function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffe
     if (!next) return { lines: ["[WARN] Nothing staged. git add <path> first (git status shows what changed)."] };
     const made = next.commits[0];
     const count = Git.compareTrees(Git.headTree(repo), made.tree ?? {}).length;
-    return { lines: [`[SUCCESS] [${repo.branch} ${made.id}] ${message}`, `  ${count} file(s) changed`], effect: { type: "git", git: next } };
+    return { lines: [`[SUCCESS] [${repo.branch} ${Git.shortId(made.id)}] ${message}`, `  ${count} file(s) changed`], effect: { type: "git", git: next } };
   }
 
   if (sub === "log") {
@@ -324,7 +324,7 @@ function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffe
         .slice(0, n)
         .map(
           (commit) =>
-            `${commit.id}  ${commit.time}  ${commit.message}${commit.parent2 ? "  (merge)" : ""}${onGitHub[commit.id] ? `  [GitHub ${onGitHub[commit.id].slice(0, 7)}]` : ""}${commit.tree ? "" : "  (no snapshot: made before history was real)"}`,
+            `${Git.shortId(commit.id)}  ${commit.time}  ${commit.message}${commit.parent2 ? "  (merge)" : ""}${onGitHub[commit.id] ? `  [GitHub ${onGitHub[commit.id].slice(0, 7)}]` : ""}${commit.tree ? "" : "  (no snapshot: made before history was real)"}`,
         ),
     };
   }
@@ -351,7 +351,7 @@ function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffe
   if (sub === "show") {
     const commit = Git.findCommit(repo, args[1] ?? "HEAD");
     if (!commit) return { lines: [`[ERROR] unknown commit '${args[1] ?? "HEAD"}'`] };
-    const lines = [`commit ${commit.id}`, `Date:   ${commit.time}`, "", `    ${commit.message}`, ""];
+    const lines = [`commit ${Git.shortId(commit.id)}`, `Date:   ${commit.time}`, "", `    ${commit.message}`, ""];
     if (!commit.tree) return { lines: [...lines, "(no snapshot: made before history was real)"] };
     const parent = commit.parent ? repo.commits.find((item) => item.id === commit.parent)?.tree ?? {} : {};
     for (const change of Git.compareTrees(parent, commit.tree)) {
@@ -377,13 +377,13 @@ function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffe
   if (sub === "branch") {
     const flag = args[1];
     const branches = repo.branches ?? {};
-    if (!flag) return { lines: Object.keys(branches).sort().map((name) => `${name === repo.branch ? "*" : " "} ${name}${branches[name] ? `  ${branches[name]}` : "  (no commits)"}`) };
+    if (!flag) return { lines: Object.keys(branches).sort().map((name) => `${name === repo.branch ? "*" : " "} ${name}${branches[name] ? `  ${Git.shortId(branches[name])}` : "  (no commits)"}`) };
     if (flag === "-d" || flag === "-D") {
       const result = Git.deleteBranch(repo, args[2] ?? "", flag === "-D");
       return typeof result === "string" ? { lines: [`[ERROR] ${result}`] } : { lines: [`[SUCCESS] Deleted branch ${args[2]}`], effect: { type: "git", git: result } };
     }
     const result = Git.createBranch(repo, flag);
-    return typeof result === "string" ? { lines: [`[ERROR] ${result}`] } : { lines: [`[SUCCESS] Created branch ${flag} at ${Git.headCommit(repo)?.id ?? "(no commits)"}`], effect: { type: "git", git: result } };
+    return typeof result === "string" ? { lines: [`[ERROR] ${result}`] } : { lines: [`[SUCCESS] Created branch ${flag} at ${Git.shortId(Git.headCommit(repo)?.id) || "(no commits)"}`], effect: { type: "git", git: result } };
   }
 
   if (sub === "switch" || (sub === "checkout" && !args.includes("--"))) {
@@ -455,13 +455,13 @@ function git(args: string[], ctx: TermCtx): { lines: string[]; effect?: TermEffe
     if (dash !== 2) return { lines: ["[ERROR] git checkout <commit> -- <path>, or git checkout <branch>"] };
     const commit = Git.findCommit(repo, args[1]);
     if (!commit) return { lines: [`[ERROR] unknown commit '${args[1]}'`] };
-    if (!commit.tree) return { lines: [`[ERROR] ${commit.id} has no snapshot (made before history was real)`] };
+    if (!commit.tree) return { lines: [`[ERROR] ${Git.shortId(commit.id)} has no snapshot (made before history was real)`] };
     const tree = commit.tree;
     const paths = args.slice(3).flatMap((arg) => repoPaths(arg, ctx, Object.keys(tree))).flatMap((path) => (path === "." ? Object.keys(tree) : [path]));
     if (paths.length === 0) return { lines: ["[ERROR] git checkout <commit> -- <path>"] };
     const index = { ...(repo.index ?? {}) };
     for (const path of paths) if (path in tree) index[path] = tree[path];
-    return writeBack(repo, { ...repo, index }, paths, tree, ctx, `checked out from ${commit.id}`);
+    return writeBack(repo, { ...repo, index }, paths, tree, ctx, `checked out from ${Git.shortId(commit.id)}`);
   }
 
   if (sub === "fetch" || sub === "rebase") {

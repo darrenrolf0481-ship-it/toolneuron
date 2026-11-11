@@ -58,6 +58,7 @@ export function CrimsonOS() {
 
       <div className="flex min-w-0 flex-1 flex-col pb-16 md:pb-0">
         <TopBar />
+        <SaveBanner />
         <div className="os-grid relative min-h-0 flex-1 overflow-hidden">
           {tab === "toolneuron" && <Hub />}
           {tab === "terminal" && <TerminalView />}
@@ -190,5 +191,16 @@ function TopBar() {
         </span>
       </div>
     </header>
+  );
+}
+
+/** Storage problems (full storage, another tab took over, history missing) shown on every tab. */
+function SaveBanner() {
+  const saveError = useOs((state) => state.saveError);
+  if (!saveError) return null;
+  return (
+    <div role="alert" aria-label="Save problem" className="shrink-0 border-b border-primary/60 bg-surface px-3 py-2 text-xs leading-5 text-fg md:px-5">
+      {saveError}
+    </div>
   );
 }

@@ -63,7 +63,7 @@ async function handle(request: Request): Promise<Response> {
     // Browser already gone (Stop before any provider answered): nothing to send.
     if (request.signal.aborted) return new Response(null, { status: 204 });
     failures.push(attempt.error);
-    if (attempt.timedOut) break;
+    if (attempt.timedOut || attempt.final) break;
   }
   return single({ t: "error", v: failures.join(" ") });
 }
@@ -73,7 +73,13 @@ type UpstreamEvent = { piece?: string; error?: string; model?: string; finish?: 
 
 type Attempt =
   | { ok: true; buffered: UpstreamEvent[]; events: AsyncGenerator<UpstreamEvent>; model: string }
-  | { ok: false; error: string; timedOut?: boolean };
+  | {
+      ok: false;
+      error: string;
+      timedOut?: boolean;
+      /** The model answered, but spent its whole budget thinking: another provider would only repeat that, so stop. */
+      final?: boolean;
+    };
 
 /**
  * Calls one provider and reads until its first piece of text. Anything that
@@ -108,7 +114,9 @@ async function open(provider: ProviderConfig, input: ChatInput, signal: AbortSig
     const text = contentText(body.choices?.[0]?.message?.content).trim();
     if (!text) {
       const detail = typeof body.error === "string" ? body.error : body.error?.message;
-      return { ok: false, error: detail ? `${provider.label}: ${String(detail).slice(0, 200)}` : `${provider.label} returned an empty reply.` };
+      if (detail) return { ok: false, error: `${provider.label}: ${String(detail).slice(0, 200)}` };
+      if (body.choices?.[0]?.finish_reason === "length") return { ok: false, error: `${provider.label} (${body.model ?? model}) spent its whole token budget thinking and wrote no answer. Try Precise, or ask again.`, final: true };
+      return { ok: false, error: `${provider.label} returned an empty reply.` };
     }
     const only: UpstreamEvent = { piece: text, model: body.model ?? model, finish: body.choices?.[0]?.finish_reason ?? "" };
     return { ok: true, buffered: [only], events: (async function* () {})(), model: body.model ?? model };
@@ -122,13 +130,10 @@ async function open(provider: ProviderConfig, input: ChatInput, signal: AbortSig
       const next = await events.next();
       if (next.done) {
         const finish = [...buffered].reverse().find((event) => event.finish)?.finish;
-        return {
-          ok: false,
-          error:
-            finish === "length"
-              ? `${provider.label} (${servedModel}) spent its whole token budget thinking and wrote no answer.`
-              : `${provider.label} returned an empty reply.`,
-        };
+        if (finish === "length") {
+          return { ok: false, error: `${provider.label} (${servedModel}) spent its whole token budget thinking and wrote no answer. Try Precise, or ask again.`, final: true };
+        }
+        return { ok: false, error: `${provider.label} returned an empty reply.` };
       }
       const event = next.value;
       if (event.model) servedModel = event.model;
