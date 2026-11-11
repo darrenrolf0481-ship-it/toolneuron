@@ -10,10 +10,13 @@
  *   AI_DAILY_CAP       whole server, per UTC day, default 500
  *   COOKIE_SECURE      "true" when served over HTTPS (default: false, for the
  *                      ssh-tunnel http://localhost setup)
+ *   TRUST_PROXY        "true" only behind a reverse proxy that sets
+ *                      X-Forwarded-For; otherwise the header is ignored
+ *                      (a client could send any address and dodge the limits)
  */
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { deleteCookie, getCookie, getRequestIP, setCookie } from "@tanstack/react-start/server";
-import { assertSameSiteRequest } from "@/lib/auth/isolation.server";
+import { assertSameSiteRequest, CrossSiteRequestError } from "@/lib/auth/isolation.server";
 import { env } from "@/lib/env.server";
 
 const COOKIE = "tn_access";
@@ -49,23 +52,33 @@ const attempts = new Map<string, number[]>();
 
 function clientIp(): string {
   try {
-    return getRequestIP({ xForwardedFor: true }) ?? "unknown";
+    return getRequestIP({ xForwardedFor: env("TRUST_PROXY") === "true" }) ?? "unknown";
   } catch {
     return "unknown";
   }
 }
 
+/** True for the error assertSameSiteRequest throws; anything else is a real failure and should surface. */
+export function isCrossSite(error: unknown): boolean {
+  return error instanceof CrossSiteRequestError;
+}
+
 function hit(map: Map<string, number[]>, id: string, windowMs: number, limit: number): boolean {
   const now = Date.now();
   const recent = (map.get(id) ?? []).filter((t) => now - t < windowMs);
-  if (recent.length >= limit) {
-    map.set(id, recent);
-    return false;
-  }
-  recent.push(now);
+  const allowed = recent.length < limit;
+  if (allowed) recent.push(now);
+  // Re-insert so the Map's order is least recently used first.
+  map.delete(id);
   map.set(id, recent);
-  if (map.size > 5000) map.clear(); // crude bound on memory
-  return true;
+  // Bound memory by dropping the least recently used keys; never clear the lockouts wholesale.
+  if (map.size > 5000) {
+    for (const key of map.keys()) {
+      if (map.size <= 4000) break;
+      map.delete(key);
+    }
+  }
+  return allowed;
 }
 
 export function unlock(candidate: string): { ok: true } | { ok: false; error: string } {

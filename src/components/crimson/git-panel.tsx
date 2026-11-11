@@ -61,7 +61,8 @@ export function GitPanel() {
 
   const branches = Object.keys(git.branches ?? { [git.branch]: undefined }).sort();
   const plan = Git.pushPlan(git);
-  const toPush = typeof plan === "string" ? 0 : plan.commits.length;
+  const toPush = typeof plan === "string" ? 0 : plan.moveTo ? 1 : plan.commits.length;
+  const pushLabel = typeof plan !== "string" && plan.moveTo ? `Move GitHub ${plan.branch} to ${plan.moveTo.slice(0, 7)}` : `Push ${toPush} commit(s)`;
 
   return (
     <div className="os-scroll flex-1 space-y-4 overflow-y-auto p-4">
@@ -139,7 +140,7 @@ export function GitPanel() {
             }}
             className="min-h-11 rounded-2xl bg-primary px-4 text-sm font-semibold text-on-primary disabled:opacity-40"
           >
-            {pushing ? "Working…" : toPush ? `Push ${toPush} commit(s)` : "Nothing to push"}
+            {pushing ? "Working…" : toPush ? pushLabel : "Nothing to push"}
           </button>
         </div>
       )}

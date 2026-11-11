@@ -7,6 +7,10 @@
  *                  Use a fine-grained token limited to the repos you want,
  *                  with "Contents: Read and write" (and "Metadata: Read").
  *                  It stays on the server: the browser never sees it.
+ *   GITHUB_REPOS   comma-separated repos the token may be used for:
+ *                  "owner/name" or "owner/*". Unset or empty: the token is
+ *                  never used (public clones still work as plain copies;
+ *                  private clones, pull and push are refused).
  */
 import { env } from "@/lib/env.server";
 
@@ -15,6 +19,22 @@ const API = "https://api.github.com";
 export function githubToken(): string | undefined {
   const token = env("GITHUB_TOKEN")?.trim();
   return token ? token : undefined;
+}
+
+/** True when the token may be used for `repo` (owner/name), per GITHUB_REPOS. Fails closed. */
+export function repoAllowed(repo: string): boolean {
+  const list = (env("GITHUB_REPOS") ?? "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  const target = repo.toLowerCase();
+  const owner = target.split("/")[0];
+  return list.some((item) => item === target || item === `${owner}/*`);
+}
+
+/** The refusal for a repo outside GITHUB_REPOS. */
+export function notAllowed(repo: string, action: string): string {
+  return `${action} is not allowed for ${repo}: add it to GITHUB_REPOS on the server (owner/name or owner/*).`;
 }
 
 export type GitHubError = { ok: false; status: number; error: string };

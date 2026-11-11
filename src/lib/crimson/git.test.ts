@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { abortMerge, add, applyChanges, collect, commit, createBranch, diffText, EMPTY_GIT, findCommit, hash, history, init, markPushed, MAX_COMMITS, merge3, mergeBlockers, mergeBranch, mergeTrees, newestOnGitHub, normalizeGit, pathOf, pushPlan, replayRemote, setRemote, status, subtree, switchBranch, unstage, workingFiles } from "./git.ts";
+import { abortMerge, blob, add, commitFiles, historyComplete, localIdOf, pullSnapshot, treeParentOf, applyChanges, collect, commit, createBranch, diffText, EMPTY_GIT, findCommit, hash, history, init, markPushed, MAX_COMMITS, merge3, mergeBlockers, mergeBranch, mergeTrees, normalizeGit, pathOf, pushPlan, setRemote, status, subtree, switchBranch, unstage, workingFiles } from "./git.ts";
 import type { ProjectFile } from "./types.ts";
 
 const files: ProjectFile[] = [
@@ -126,46 +126,6 @@ describe("branches", () => {
   });
 });
 
-describe("push plan", () => {
-  const sha = (n: number) => String(n).repeat(40).slice(0, 40);
-  it("sends commits after the newest one already on GitHub, as changes under the remote folder", () => {
-    let git = commit(add(init(EMPTY_GIT), { "site/index.html": "v1", "notes.txt": "x" }, ["."]).git, "clone", "t0")!;
-    git = setRemote(git, "me/site", "site", { main: "main" }, { [git.branches!.main!]: sha(1) });
-    assert.match(pushPlan(git) as string, /Everything up-to-date/);
-    git = commit(add(git, { "site/index.html": "v2", "notes.txt": "y" }, ["."]).git, "edit", "t1")!;
-    git = commit(add(git, { "site/about.html": "a", "notes.txt": "y" }, ["."]).git, "about, remove index", "t2")!;
-    const plan = pushPlan(git);
-    assert.ok(typeof plan !== "string");
-    assert.equal(plan.expectSha, sha(1));
-    assert.deepEqual(plan.commits[0].parents, [{ sha: sha(1) }]);
-    assert.deepEqual(plan.commits[1].parents, [{ index: 0 }]);
-    assert.deepEqual(plan.commits.map((c) => [c.message, c.changes]), [
-      ["edit", [{ path: "index.html", content: "v2" }]],
-      ["about, remove index", [{ path: "about.html", content: "a" }, { path: "index.html", content: null }]],
-    ]);
-    const pushed = markPushed(git, plan.commits.map((c) => c.id), [sha(2), sha(3)], "main");
-    assert.match(pushPlan(pushed) as string, /Everything up-to-date/);
-  });
-  it("a new branch pushes from where it left the pushed history", () => {
-    let git = commit(add(init(EMPTY_GIT), { "f.txt": "1" }, ["."]).git, "base", "t0")!;
-    git = setRemote(git, "me/r", "", {}, { [git.branches!.main!]: sha(4) });
-    git = { ...(createBranch(git, "fix") as typeof git), branch: "fix" };
-    git = commit(add(git, { "f.txt": "2" }, ["."]).git, "fix it", "t1")!;
-    const plan = pushPlan(git);
-    assert.ok(typeof plan !== "string");
-    assert.equal(plan.branch, "fix");
-    assert.equal(plan.expectSha, sha(4));
-    assert.equal(plan.commits.length, 1);
-  });
-  it("needs a remote and a commit", () => {
-    assert.match(pushPlan(init(EMPTY_GIT)) as string, /no remote/);
-    assert.match(pushPlan(setRemote(init(EMPTY_GIT), "me/r", "")) as string, /no commits/);
-  });
-  it("subtree keeps only the folder, relative to it", () => {
-    assert.deepEqual(subtree({ "a/x": "1", "ab/y": "2", "a/b/z": "3" }, "a"), { x: "1", "b/z": "3" });
-  });
-});
-
 describe("applyChanges", () => {
   it("updates, creates (with folders) and deletes by path", () => {
     const out = applyChanges(
@@ -254,29 +214,126 @@ describe("three-way merge of branches", () => {
   });
 });
 
-describe("push plan with merges, and pull replay", () => {
-  const sha = (c: string) => c.repeat(40);
-  it("a merge commit after a pull pushes with both parents and expects the pulled head", () => {
-    let git = commit(add(init(EMPTY_GIT), { "r/a.txt": "1\n2\n3" }, ["."]).git, "clone", "t0")!;
-    git = setRemote(git, "me/r", "r", { main: "main" }, { [git.branches!.main!]: sha("a") });
+const sha = (c: string) => c.repeat(40);
+/** A linked repo: one commit A on GitHub (sha aaaa…), GitHub's main last seen at A. */
+function linked(files: Record<string, string> = { "r/a.txt": "1\n2\n3" }, dir = "r") {
+  const g = commit(add(init(EMPTY_GIT), files, ["."]).git, "clone", "t0")!;
+  return setRemote(g, "me/r", dir, { main: "main" }, { [g.branches!.main!]: sha("a") }, { main: sha("a") });
+}
+
+describe("push plan", () => {
+  it("sends commits after GitHub's tip, relative to the remote folder, then is up to date", () => {
+    let git = linked({ "site/index.html": "v1", "notes.txt": "x" }, "site");
+    assert.match(pushPlan(git) as string, /Everything up-to-date/);
+    git = commit(add(git, { "site/index.html": "v2", "notes.txt": "y" }, ["."]).git, "edit", "t1")!;
+    git = commit(add(git, { "site/about.html": "a", "notes.txt": "y" }, ["."]).git, "about, remove index", "t2")!;
+    const plan = pushPlan(git);
+    assert.ok(typeof plan !== "string");
+    assert.equal(plan.expectSha, sha("a"));
+    assert.equal(plan.localBranch, "main");
+    assert.deepEqual(plan.commits.map((c) => [c.message, c.parents, c.treeParent, c.changes]), [
+      ["edit", [{ sha: sha("a") }], 0, [{ path: "index.html", content: "v2" }]],
+      ["about, remove index", [{ index: 0 }], 0, [{ path: "about.html", content: "a" }, { path: "index.html", content: null }]],
+    ]);
+    const pushed = markPushed(git, plan, [sha("2"), sha("3")], sha("3"));
+    assert.deepEqual(pushed.remote!.tips, { main: sha("3") });
+    assert.match(pushPlan(pushed) as string, /Everything up-to-date/);
+  });
+  it("a new branch pushes from where it left; GitHub's main tip is untouched (E4)", () => {
+    let git = linked();
+    git = { ...(createBranch(git, "feature") as typeof git), branch: "feature" };
+    git = commit(add(git, { "r/a.txt": "F" }, ["."]).git, "F", "t1")!;
+    const plan = pushPlan(git);
+    assert.ok(typeof plan !== "string");
+    assert.equal(plan.branch, "feature");
+    assert.equal(plan.expectSha, null, "feature is not on GitHub yet");
+    git = markPushed(git, plan, [sha("f")], sha("f"));
+    assert.deepEqual(git.remote!.tips, { main: sha("a"), feature: sha("f") });
+    // Fast-forward main to F: nothing new to create, but GitHub main must move.
+    const onMain = switchBranch(git, { "r/a.txt": "F" }, "main") as { git: typeof git };
+    git = (mergeBranch(onMain.git, { "r/a.txt": "1\n2\n3" }, "feature", "t2") as { git: typeof git }).git;
+    const move = pushPlan(git);
+    assert.ok(typeof move !== "string");
+    assert.equal(move.moveTo, sha("f"));
+    assert.equal(move.expectSha, sha("a"));
+    assert.deepEqual(move.commits, []);
+  });
+  it("refuses locally when GitHub's branch is ahead of this branch", () => {
+    let git = linked();
+    git = commit(add(git, { "r/a.txt": "local" }, ["."]).git, "local", "t1")!;
+    const ahead = { ...git, remote: { ...git.remote!, tips: { main: sha("z") } } };
+    assert.match(pushPlan(ahead) as string, /this project does not have: git pull first/);
+  });
+  it("needs a remote and a commit, and no merge in progress", () => {
+    assert.match(pushPlan(init(EMPTY_GIT)) as string, /no remote/);
+    assert.match(pushPlan(setRemote(init(EMPTY_GIT), "me/r", "")) as string, /no commits/);
+  });
+  it("subtree keeps only the folder, relative to it", () => {
+    assert.deepEqual(subtree({ "a/x": "1", "ab/y": "2", "a/b/z": "3" }, "a"), { x: "1", "b/z": "3" });
+  });
+});
+
+describe("pull snapshot and merge-commit pushes (E1)", () => {
+  it("one commit from the net change, mapped to GitHub's tip; the push builds the merge on the pulled side", () => {
+    let git = linked();
     git = commit(add(git, { "r/a.txt": "ONE\n2\n3" }, ["."]).git, "local", "t1")!;
-    const replayed = replayRemote(git, sha("a"), [{ sha: sha("b"), message: "on github", changes: [{ path: "a.txt", content: "1\n2\nTHREE" }, { path: "new.txt", content: "n" }] }], "t2");
-    assert.ok(typeof replayed !== "string");
-    const tip = replayed.git.commits.find((c) => c.id === replayed.tip)!;
-    assert.deepEqual(Object.keys(tip.tree!).sort(), ["r/a.txt", "r/new.txt"], "remote paths land under the folder");
-    const merged = mergeBranch({ ...replayed.git, branches: { ...replayed.git.branches, upstream: replayed.tip } }, { "r/a.txt": "ONE\n2\n3" }, "upstream", "t3");
+    const snap = pullSnapshot(git, localIdOf(git, sha("a"))!, sha("b"), [{ path: "a.txt", content: "1\n2\nTHREE" }, { path: "new.txt", content: "n" }, { path: "asset.bin", content: null, unsupported: true }], "Pull", "t2");
+    assert.ok(typeof snap !== "string");
+    const tip = snap.git.commits.find((c) => c.id === snap.tip)!;
+    assert.deepEqual(Object.keys(tip.tree!).sort(), ["r/a.txt", "r/new.txt"], "unheld unsupported files stay out of local trees");
+    assert.deepEqual(snap.dropped, []);
+    const merged = mergeBranch({ ...snap.git, branches: { ...snap.git.branches, upstream: snap.tip }, remote: { ...snap.git.remote!, tips: { main: sha("b") } } }, { "r/a.txt": "ONE\n2\n3" }, "upstream", "t3");
     assert.ok(typeof merged !== "string" && merged.conflicts.length === 0);
-    assert.equal(newestOnGitHub(merged.git)?.id, replayed.tip);
     const plan = pushPlan(merged.git);
     assert.ok(typeof plan !== "string");
     assert.equal(plan.expectSha, sha("b"));
-    assert.deepEqual(plan.commits.map((c) => c.message), ["local", merged.git.commits[0].message]);
-    assert.deepEqual(plan.commits[0].parents, [{ sha: sha("a") }]);
-    assert.deepEqual(plan.commits[1].parents, [{ index: 0 }, { sha: sha("b") }]);
-    assert.deepEqual(plan.commits[1].changes, [{ path: "a.txt", content: "ONE\n2\nTHREE" }, { path: "new.txt", content: "n" }]);
+    const merge = plan.commits[1];
+    assert.deepEqual(merge.parents, [{ index: 0 }, { sha: sha("b") }]);
+    assert.equal(merge.treeParent, 1, "built on GitHub's new tree, so files this browser lacks keep GitHub's version");
+    assert.deepEqual(merge.changes, [{ path: "a.txt", content: "ONE\n2\nTHREE" }], "only our side's change, relative to the pulled tree");
   });
-  it("replay refuses an unknown base", () => {
-    const git = setRemote(init(EMPTY_GIT), "me/r", "");
-    assert.match(replayRemote(git, sha("c"), [], "t") as string, /no longer in local history/);
+  it("drops a held file GitHub made unsupported, unless this branch changed it", () => {
+    const git = linked({ "r/a.txt": "1", "r/big.txt": "small" });
+    const base = localIdOf(git, sha("a"))!;
+    const ok = pullSnapshot(git, base, sha("b"), [{ path: "big.txt", content: null, unsupported: true }], "Pull", "t1");
+    assert.ok(typeof ok !== "string");
+    assert.deepEqual(ok.dropped, ["r/big.txt"]);
+    assert.equal("r/big.txt" in ok.git.commits.find((c) => c.id === ok.tip)!.tree!, false);
+    const changed = commit(add(git, { "r/a.txt": "1", "r/big.txt": "edited" }, ["."]).git, "edit big", "t1")!;
+    assert.match(pullSnapshot(changed, base, sha("b"), [{ path: "big.txt", content: null, unsupported: true }], "Pull", "t2") as string, /this branch changed it too/);
+  });
+  it("tree parent: covering side wins; both cover prefers one on GitHub; neither refuses", () => {
+    const git = linked();
+    const a = git.branches!.main!;
+    const x = commit(add(git, { "r/a.txt": "x" }, ["."]).git, "x", "t1")!;
+    assert.equal(treeParentOf(x, [x.branches!.main!, a]), 1, "both reach only aaaa: prefer the one on GitHub");
+    const twoSides = { ...x, remote: { ...x.remote!, shas: { ...x.remote!.shas, [x.branches!.main!]: sha("c") } } };
+    const y = { ...twoSides, commits: [{ id: "yyyyyyy", message: "y", time: "t", parent: a, tree: {} }, ...twoSides.commits], remote: { ...twoSides.remote!, shas: { ...twoSides.remote!.shas, yyyyyyy: sha("d") } } };
+    assert.equal(treeParentOf(y, [y.branches!.main!, "yyyyyyy"]), null);
+  });
+});
+
+describe("history safety", () => {
+  it("a missing merge base is an error, never an empty base (E5b)", () => {
+    let g = commit(add(init(EMPTY_GIT), { "a.txt": "keep", "b.txt": "b0" }, ["."]).git, "A", "t0")!;
+    g = createBranch(g, "feature") as typeof g;
+    g = commit(add(g, { "b.txt": "b0" }, ["."]).git, "delete a", "t1")!;
+    for (let i = 0; i < 55; i++) g = commit(add(g, { "b.txt": `b${i + 1}` }, ["."]).git, `m${i}`, `t${i + 2}`)!;
+    assert.equal(historyComplete(g, g.branches!.main), false);
+    assert.match(mergeBranch(g, { "b.txt": "b55" }, "feature", "t99") as string, /no longer stored/);
+  });
+  it("trim keeps the commit GitHub's branch was last seen at", () => {
+    let g = linked({ "r/a.txt": "0" });
+    const cloneId = g.branches!.main!;
+    for (let i = 0; i < 55; i++) g = commit(add(g, { "r/a.txt": `${i + 1}` }, ["."]).git, `m${i}`, `t${i}`)!;
+    assert.ok(g.commits.some((c) => c.id === cloneId));
+  });
+  it("commitFiles commits only the given paths and keeps other staged work staged", () => {
+    let g = commit(add(init(EMPTY_GIT), { "a.txt": "1" }, ["."]).git, "base", "t0")!;
+    g = add(g, { "a.txt": "staged edit" }, ["a.txt"]).git;
+    const done = commitFiles(g, { "repo/x.txt": "x" }, "Clone", "t1") as typeof g;
+    assert.deepEqual(Object.keys(done.commits[0].tree!).sort(), ["a.txt", "repo/x.txt"]);
+    assert.equal(blob(done, done.commits[0].tree!["a.txt"]), "1", "the staged edit is not in the clone commit");
+    assert.equal(blob(done, done.index!["a.txt"]), "staged edit", "and stays staged");
   });
 });

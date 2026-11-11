@@ -13,7 +13,7 @@ import { parseRepo } from "@/lib/crimson/terminal";
  * result fits in browser storage. Only github.com, api.github.com and
  * codeload.github.com are fetched.
  *
- * With GITHUB_TOKEN set: private repos work too, and the reply carries the
+ * With GITHUB_TOKEN set and the repo on GITHUB_REPOS: private repos work too, and the reply carries the
  * commit sha and branch, so the copy can be linked for git push
  * ("linked": true). Without it: public repos only, as a plain copy.
  *
@@ -52,11 +52,12 @@ async function readCapped(response: Response, cap: number): Promise<Uint8Array |
 }
 
 async function handle(request: Request): Promise<Response> {
-  const { guardCloneCall } = await import("@/lib/crimson/access.server");
+  const { guardCloneCall, isCrossSite } = await import("@/lib/crimson/access.server");
   let refused: string | null;
   try {
     refused = guardCloneCall();
-  } catch {
+  } catch (error) {
+    if (!isCrossSite(error)) throw error;
     return json({ ok: false, error: "Cross-site request refused." }, 403);
   }
   if (refused) return json({ ok: false, error: refused });
@@ -66,8 +67,10 @@ async function handle(request: Request): Promise<Response> {
   if (!repo) return json({ ok: false, error: "Give a public GitHub repo as owner/name." }, 400);
 
   const signal = AbortSignal.any([request.signal, AbortSignal.timeout(60_000)]);
-  const { gh, githubToken } = await import("@/lib/crimson/github.server");
-  const token = githubToken();
+  const { gh, githubToken, repoAllowed } = await import("@/lib/crimson/github.server");
+  // The token is only ever used for repos on GITHUB_REPOS; anything else is cloned as a public, unlinked copy.
+  const allowed = repoAllowed(repo);
+  const token = allowed ? githubToken() : undefined;
   // With a token: look up the default branch and its commit, so the copy can be linked for push.
   let link: { sha: string; branch: string; private: boolean } | null = null;
   if (token) {
@@ -95,7 +98,12 @@ async function handle(request: Request): Promise<Response> {
   const host = new URL(response.url).hostname;
   if (!ALLOWED_HOSTS.has(host)) return json({ ok: false, error: "GitHub redirected somewhere unexpected; refused." });
   if (response.status === 404) {
-    return json({ ok: false, error: token ? `${repo} was not found, or the token cannot see it.` : `${repo} was not found. It may be private (set GITHUB_TOKEN on the server to clone private repos) or misspelled.` });
+    return json({
+      ok: false,
+      error: token
+        ? `${repo} was not found, or the token cannot see it.`
+        : `${repo} was not found. It may be private (private repos need GITHUB_TOKEN and the repo on GITHUB_REPOS) or misspelled.`,
+    });
   }
   if (!response.ok) return json({ ok: false, error: `GitHub returned ${response.status} for ${repo}.` });
 
@@ -111,7 +119,7 @@ async function handle(request: Request): Promise<Response> {
   }
   const result = readTar(tar, DEFAULT_CLONE_LIMITS);
   if (result.files.length === 0) return json({ ok: false, error: `${repo} has no text files within the limits.` });
-  return json({ ok: true, repo, files: result.files, skipped: result.skipped, limits: DEFAULT_CLONE_LIMITS, linked: Boolean(link), ...(link ?? {}) });
+  return json({ ok: true, repo, files: result.files, skipped: result.skipped, limits: DEFAULT_CLONE_LIMITS, linked: Boolean(link), ...(link ?? {}), ...(githubToken() && !allowed ? { notAllowed: true } : {}) });
 }
 
 export const Route = createFileRoute("/api/clone")({

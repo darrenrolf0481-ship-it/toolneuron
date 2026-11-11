@@ -135,6 +135,12 @@ export type GitRemote = {
   track: Record<string, string>;
   /** Local commit id → GitHub commit sha, for every commit known to be on GitHub. */
   shas: Record<string, string>;
+  /**
+   * Remote branch → the GitHub sha it pointed at when last seen (set by
+   * clone, pull and push). This, not "any commit known to be on GitHub", is
+   * where a push must fast-forward from and where a pull starts.
+   */
+  tips?: Record<string, string>;
 };
 
 export type EditorMode = "code" | "preview" | "git";

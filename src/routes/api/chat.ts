@@ -27,13 +27,14 @@ function single(value: unknown, status = 200): Response {
 }
 
 async function handle(request: Request): Promise<Response> {
-  const { guardAiCall } = await import("@/lib/crimson/access.server");
+  const { guardAiCall, isCrossSite } = await import("@/lib/crimson/access.server");
   const { fallbackOrder, resolveProvider, tokenCaps } = await import("@/lib/crimson/providers.server");
 
   let refused: string | null;
   try {
     refused = guardAiCall();
-  } catch {
+  } catch (error) {
+    if (!isCrossSite(error)) throw error;
     return single({ t: "error", v: "Cross-site request refused." }, 403);
   }
   if (refused) return single({ t: "error", v: refused });

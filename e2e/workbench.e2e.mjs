@@ -174,7 +174,10 @@ describe("branches and push", () => {
     let n = 0;
     const app = await openApp({
       clone: { ok: true, repo: "me/site", linked: true, sha: sha("a"), branch: "main", private: true, files: [{ path: "index.html", content: "<h1>v1</h1>\n" }], skipped: { binary: 1, tooLarge: 0, ignoredFolder: 0, overLimit: 0 } },
-      push: (plan) => ({ ok: true, shas: plan.commits.map(() => sha(String(++n))), url: "https://github.com/me/site/tree/main", created: false }),
+      push: (plan) => {
+        const shas = plan.commits.map(() => sha(String(++n)));
+        return { ok: true, shas, tip: shas.at(-1), url: "https://github.com/me/site/tree/main", created: false };
+      },
     });
     await app.page.getByRole("button", { name: "Term" }).first().click();
     await app.term("gh repo clone me/site");
@@ -259,8 +262,11 @@ describe("pull and merge conflicts", () => {
   it("pull brings a conflict; resolving it in the Git tab and pushing sends a merge commit", async () => {
     const app = await openApp({
       clone: { ok: true, repo: "me/site", linked: true, sha: sha("a"), branch: "main", files: [{ path: "page.txt", content: "title\nbody\nfooter" }], skipped: {} },
-      fetch: { ok: true, head: sha("b"), commits: [{ sha: sha("b"), message: "Edit on GitHub", changes: [{ path: "page.txt", content: "title\nBODY FROM GITHUB\nfooter" }], skipped: [] }] },
-      push: (plan) => ({ ok: true, shas: plan.commits.map((_, i) => String(i + 1).repeat(40)), url: "https://github.com/me/site/tree/main", created: false }),
+      fetch: { ok: true, tip: sha("b"), ahead: 1, subjects: ["Edit on GitHub"], changes: [{ path: "page.txt", content: "title\nBODY FROM GITHUB\nfooter" }] },
+      push: (plan) => {
+        const shas = plan.commits.map((_, i) => String(i + 1).repeat(40));
+        return { ok: true, shas, tip: shas.at(-1), url: "https://github.com/me/site/tree/main", created: false };
+      },
     });
     await app.page.getByRole("button", { name: "Term" }).first().click();
     await app.term("gh repo clone me/site");
@@ -277,7 +283,7 @@ describe("pull and merge conflicts", () => {
     await app.term("git pull");
     await app.page.waitForTimeout(600);
     const text = await app.page.locator(".os-scroll").first().innerText();
-    assert.match(text, /Fetched 1 commit\(s\): Edit on GitHub/);
+    assert.match(text, /Fetched 1 commit\(s\) from GitHub: Edit on GitHub/);
     assert.match(text, /CONFLICT in site\/page\.txt/);
     assert.match(await app.term("cat project/site/page.txt"), /<<<<<<< ours[\s\S]*body edited here[\s\S]*=======[\s\S]*BODY FROM GITHUB[\s\S]*>>>>>>> theirs/);
     // Resolve in the editor, mark fixed and commit from the Git tab.
@@ -298,6 +304,7 @@ describe("pull and merge conflicts", () => {
     const plan = app.pushes[0];
     assert.equal(plan.expectSha, sha("b"), "fast-forward from what GitHub has now");
     assert.deepEqual(plan.commits.map((c) => c.parents), [[{ sha: sha("a") }], [{ index: 0 }, { sha: sha("b") }]]);
+    assert.equal(plan.commits[1].treeParent, 1, "the merge is built on GitHub's side (E1)");
     assert.match(plan.commits[1].changes[0].content, /plus GitHub's/);
     assert.deepEqual(app.errors, []);
     await app.close();

@@ -39,13 +39,20 @@ that shaped the work, plus the design notes for the swarm and the skills.
 - **Clone, pull and push with GitHub.** `gh repo clone owner/name` downloads the
   repo on the server and copies its text files into a project folder (up to
   300 files / 1 MB; binaries and `node_modules`-style folders are left out).
-  With `GITHUB_TOKEN` set, private repos work too, and the folder is linked:
+  With `GITHUB_TOKEN` set and the repo on `GITHUB_REPOS`, private repos work
+  too, and the folder is linked:
   commit inside it and `git push` sends each commit to GitHub as a real
   commit (files left out of the copy stay untouched). New local branches
   push to new GitHub branches, and merge commits keep both parents. Push only
   fast-forwards and never forces; if GitHub has commits you don't, it is
-  refused: `git pull` fetches them (up to 50 commits at a time, text files)
-  and merges them in, with conflicts handled as above.
+  refused: `git pull` brings GitHub's current state in as one commit (the net
+  change since the tip last seen, up to 300 files / 1.5 MB of text) and merges
+  it, with conflicts handled as above. Files the app cannot hold (binary, over
+  200 KB, symlinks) are never downloaded and always keep GitHub's version on
+  push; if GitHub turns a file you hold into one of those, it is removed here
+  with a notice, or the pull is refused if your branch changed it. The app
+  remembers where each GitHub branch was last seen, and a push or pull is
+  tied to the branch it started on.
   `git remote add origin owner/name [folder]` links a folder to a repo branch
   that does not exist yet, including an empty repo (the app makes a
   placeholder commit so GitHub's API accepts the push, then replaces it).
@@ -94,7 +101,9 @@ Set in `.env`; see `.env.example` and the header of
 | `OPENROUTER_REASONING_EFFORT`, `OMNIROUTE_REASONING_EFFORT` | `low` / `medium` / `high`: keeps a reasoning model's thinking short |
 | `AI_FALLBACK` | `off` stops chat, the terminal's `ai` and the Swarm from trying the other providers when the chosen one fails before answering |
 | `CLONE_PER_MIN` | Clone, pull and push calls allowed per client per minute, together (default 12) |
-| `GITHUB_TOKEN` | Enables push and private clones. Prefer a fine-grained token limited to the repos you want, with Contents: read & write. Stays on the server |
+| `GITHUB_TOKEN` | Enables push, pull and private clones. Prefer a fine-grained token limited to the repos you want, with Contents: read & write. Stays on the server |
+| `GITHUB_REPOS` | Comma-separated `owner/name` or `owner/*` the token may be used for. Unset: the token is never used (public clones only, as plain copies) |
+| `TRUST_PROXY` | `true` only behind a reverse proxy that sets `X-Forwarded-For`; otherwise that header is ignored by the rate limits |
 
 **Free models.** Most free models are reasoning models: they think before
 answering, and the thinking counts against the reply cap. With the default

@@ -32,10 +32,20 @@ export function normalizeGit(raw: unknown): GitState {
   const branches = git.branches && typeof git.branches === "object" ? { ...git.branches } : { [branch]: commits[0]?.id };
   if (!(branch in branches)) branches[branch] = undefined;
   const head = commits.find((commit) => commit.id === branches[branch]);
-  const remote =
+  let remote =
     git.remote && typeof git.remote.repo === "string"
       ? { ...git.remote, dir: git.remote.dir ?? "", track: git.remote.track ?? {}, shas: git.remote.shas ?? {} }
       : undefined;
+  if (remote && !remote.tips) {
+    // Saves from before tips were tracked: the best guess is the newest GitHub commit each tracked branch reaches.
+    const tips: Record<string, string> = {};
+    const partial = { ...(git as GitState), commits, branches, remote } as GitState;
+    for (const [local, remoteBranch] of Object.entries(remote.track)) {
+      const found = history(partial, branches[local]).find((commit) => remote!.shas[commit.id]);
+      if (found) tips[remoteBranch] = remote.shas[found.id];
+    }
+    remote = { ...remote, tips };
+  }
   return {
     initialized: Boolean(git.initialized),
     branch,
@@ -245,10 +255,36 @@ export function mergeBlockers(git: GitState): string[] {
   return out;
 }
 
+/**
+ * Commits exactly `files` (path → contents) on top of the last commit,
+ * leaving anything else that is staged staged (used for a linked clone).
+ * Refuses during a merge.
+ */
+export function commitFiles(git: GitState, files: Record<string, string>, message: string, time: string): GitState | string {
+  if (git.merging) return "a merge is in progress";
+  const added: Tree = {};
+  const blobs = { ...(git.blobs ?? {}) };
+  for (const [path, content] of Object.entries(files)) {
+    const id = hash(content);
+    blobs[id] = content;
+    added[path] = id;
+  }
+  const parent = headCommit(git)?.id;
+  const tree = { ...headTree(git), ...added };
+  const id = hash(`${parent ?? ""}\n${time}\n${message}\n${JSON.stringify(tree)}\n${git.commits.length}`).slice(0, 7);
+  const made: Commit = { id, message, time, parent, tree };
+  return trim({ ...git, blobs, index: { ...(git.index ?? {}), ...added }, branches: { ...(git.branches ?? {}), [git.branch]: id }, commits: [made, ...git.commits] });
+}
+
 /** Keeps the newest MAX_COMMITS commits plus every branch head, then drops unused blobs. */
 function trim(git: GitState): GitState {
   const heads = new Set(Object.values(git.branches ?? {}).filter((id): id is string => Boolean(id)));
   if (git.merging) heads.add(git.merging.theirs);
+  // Keep the commits GitHub's branches were last seen at: push and pull start from them.
+  for (const sha of Object.values(git.remote?.tips ?? {})) {
+    const id = Object.entries(git.remote?.shas ?? {}).find(([, known]) => known === sha)?.[0];
+    if (id) heads.add(id);
+  }
   const commits = git.commits.filter((commit, index) => index < MAX_COMMITS || heads.has(commit.id));
   return collect({ ...git, commits });
 }
@@ -354,6 +390,10 @@ export function mergeInto(git: GitState, work: Record<string, string>, theirs: s
     };
   }
   const base = mergeBase(git, ours, theirs);
+  if (!base && (!historyComplete(git, ours) || !historyComplete(git, theirs))) {
+    // Without the real common ancestor every difference would look like a change from nothing.
+    return "these histories share an ancestor that is no longer stored (old commits were trimmed), so they cannot be merged safely";
+  }
   const merged = mergeTrees(git, base?.tree ?? {}, headTree(git), target);
   const blobs = { ...(git.blobs ?? {}), ...merged.blobs };
   const index = { ...merged.clean };
@@ -522,8 +562,15 @@ export function subtree(tree: Tree, dir: string): Tree {
   return Object.fromEntries(Object.entries(tree).filter(([path]) => path.startsWith(prefix)).map(([path, id]) => [path.slice(prefix.length), id]));
 }
 
-export function setRemote(git: GitState, repo: string, dir: string, track: Record<string, string> = {}, shas: Record<string, string> = {}): GitState {
-  return { ...git, remote: { repo, dir: dir.replace(/^\/+|\/+$/g, ""), track, shas } };
+export function setRemote(
+  git: GitState,
+  repo: string,
+  dir: string,
+  track: Record<string, string> = {},
+  shas: Record<string, string> = {},
+  tips: Record<string, string> = {},
+): GitState {
+  return { ...git, remote: { repo, dir: dir.replace(/^\/+|\/+$/g, ""), track, shas, tips } };
 }
 
 export function removeRemote(git: GitState): GitState {
@@ -532,41 +579,87 @@ export function removeRemote(git: GitState): GitState {
   return next;
 }
 
+/** The GitHub branch the local branch pushes to and pulls from. */
+export function remoteBranchOf(git: GitState, localBranch = git.branch): string {
+  return git.remote?.track[localBranch] ?? localBranch;
+}
+
+/** The local commit recorded for a GitHub sha, if any. */
+export function localIdOf(git: GitState, sha: string | undefined): string | undefined {
+  if (!sha || !git.remote) return undefined;
+  return Object.entries(git.remote.shas).find(([id, known]) => known === sha && byId(git, id))?.[0];
+}
+
+/** GitHub shas reachable from a commit (including its own). */
+function knownReach(git: GitState, id: string | undefined): Set<string> {
+  const shas = git.remote?.shas ?? {};
+  return new Set(history(git, id).map((commit) => shas[commit.id]).filter((sha): sha is string => Boolean(sha)));
+}
+
+/** True when commit `from`'s history is fully stored (no parent was trimmed away). */
+export function historyComplete(git: GitState, from: string | undefined): boolean {
+  return history(git, from).every((commit) => (!commit.parent || byId(git, commit.parent)) && (!commit.parent2 || byId(git, commit.parent2)));
+}
+
 /** A commit's parent in a push: a sha already on GitHub, or an earlier commit of the same push (by position). */
 export type PushParent = { sha: string } | { index: number };
 
 export type PushPlan = {
   repo: string;
+  /** Local branch the plan was made from (results are recorded against it). */
+  localBranch: string;
   /** Remote branch to update. */
   branch: string;
-  /**
-   * Where the remote branch must be for a fast-forward: the newest commit of
-   * this branch's history already on GitHub. null = none is (the remote
-   * branch must not exist yet).
-   */
+  /** Where the GitHub branch must be now (null: it must not exist yet). The server never forces. */
   expectSha: string | null;
-  /** Unpushed commits, parents before children, as changes (relative to the remote folder) from their first parent. */
-  commits: { id: string; message: string; parents: PushParent[]; changes: FileChange[] }[];
+  /**
+   * Unpushed commits, parents before children. `treeParent` is the index in
+   * `parents` whose GitHub tree the commit is built on; `changes` are relative
+   * to that parent's tree (paths relative to the remote folder). Files this
+   * browser does not hold are absent from both trees, so they never appear in
+   * `changes` and keep GitHub's version.
+   */
+  commits: { id: string; message: string; parents: PushParent[]; treeParent: number; changes: FileChange[] }[];
+  /** With no commits: move the GitHub branch to this existing sha (a fast-forward). */
+  moveTo?: string;
 };
 
-/** The newest commit reachable from the current branch that is known to be on GitHub. */
-export function newestOnGitHub(git: GitState): Commit | undefined {
+/**
+ * Which parent of a merge commit to build its GitHub tree on: the one whose
+ * known GitHub history covers the other's (after a pull-merge that is the
+ * pulled commit, so files the browser does not hold come from the newest
+ * GitHub state). Both cover: prefer a parent already on GitHub, else the
+ * first. Neither: null (two sides each hold GitHub work the other lacks).
+ */
+export function treeParentOf(git: GitState, parents: string[]): number | null {
+  if (parents.length < 2) return 0;
   const shas = git.remote?.shas ?? {};
-  return history(git).find((commit) => shas[commit.id]);
+  const reach = parents.map((id) => knownReach(git, id));
+  const covers = (a: number, b: number) => [...reach[b]].every((sha) => reach[a].has(sha));
+  const ok = parents.map((_, index) => parents.every((__, other) => other === index || covers(index, other)));
+  const candidates = ok.flatMap((good, index) => (good ? [index] : []));
+  if (candidates.length === 0) return null;
+  return candidates.find((index) => shas[parents[index]]) ?? candidates[0];
 }
 
-/** What `git push` must send: every commit reachable from the current branch that is not on GitHub yet. */
+/** What `git push` must send for the current branch. */
 export function pushPlan(git: GitState): PushPlan | string {
   const remote = git.remote;
   if (!remote) return "no remote. git remote add origin owner/name [folder] (or clone a repo while GITHUB_TOKEN is set)";
   if (git.merging) return "a merge is in progress: fix the conflicts and git commit (or git merge --abort) before pushing";
-  const reachable = history(git);
-  if (reachable.length === 0) return "nothing to push: no commits yet";
-  const branch = remote.track[git.branch] ?? git.branch;
+  const head = headCommit(git);
+  if (!head) return "nothing to push: no commits yet";
+  const branch = remoteBranchOf(git);
   const known = (id: string | undefined) => (id ? remote.shas[id] : undefined);
+  const tipSha = remote.tips?.[branch];
+  if (tipSha) {
+    const tipLocal = localIdOf(git, tipSha);
+    if (!tipLocal) return `GitHub's ${branch} is at ${tipSha.slice(0, 7)}, which this project does not have: git pull first`;
+    if (!isAncestor(git, tipLocal, head.id)) return `GitHub's ${branch} has commits this branch does not have: git pull first`;
+  }
   // Unpushed = reachable without passing through a commit already on GitHub.
   const pending = new Set<string>();
-  const stack = [reachable[0].id];
+  const stack = [head.id];
   while (stack.length) {
     const id = stack.pop()!;
     if (pending.has(id) || known(id)) continue;
@@ -576,69 +669,99 @@ export function pushPlan(git: GitState): PushPlan | string {
     if (commit.parent) stack.push(commit.parent);
     if (commit.parent2) stack.push(commit.parent2);
   }
-  if (pending.size === 0) return `Everything up-to-date (${remote.repo} ${branch})`;
+  const base = { repo: remote.repo, localBranch: git.branch, branch, expectSha: tipSha ?? null };
+  if (pending.size === 0) {
+    if (tipSha === known(head.id)) return `Everything up-to-date (${remote.repo} ${branch})`;
+    return { ...base, commits: [], moveTo: known(head.id)! };
+  }
   // Stored newest first, parents before children once reversed.
   const ordered = git.commits.filter((commit) => pending.has(commit.id)).reverse();
   const position = new Map(ordered.map((commit, index) => [commit.id, index]));
-  const commits = ordered.map((commit) => {
-    const parents: PushParent[] = [commit.parent, commit.parent2]
-      .filter((id): id is string => Boolean(id))
-      .map((id) => (known(id) ? { sha: known(id)! } : { index: position.get(id)! }));
-    const before = subtree(byId(git, commit.parent)?.tree ?? {}, remote.dir);
-    return { id: commit.id, message: commit.message, parents, changes: treeChanges(git, before, subtree(commit.tree ?? {}, remote.dir)) };
+  const commits: PushPlan["commits"] = [];
+  for (const commit of ordered) {
+    const parentIds = [commit.parent, commit.parent2].filter((id): id is string => Boolean(id));
+    const treeParent = treeParentOf(git, parentIds);
+    if (treeParent === null) {
+      return `merge ${commit.id} joins two sides that each have GitHub commits the other lacks; push one side first, or pull and merge again`;
+    }
+    const parents: PushParent[] = parentIds.map((id) => (known(id) ? { sha: known(id)! } : { index: position.get(id)! }));
+    const before = subtree(byId(git, parentIds[treeParent])?.tree ?? {}, remote.dir);
+    commits.push({ id: commit.id, message: commit.message, parents, treeParent, changes: treeChanges(git, before, subtree(commit.tree ?? {}, remote.dir)) });
+  }
+  return { ...base, commits };
+}
+
+/**
+ * Records a push result against the branches the plan was made for (not
+ * whatever is current when the reply arrives). `newTip` is set only when
+ * the GitHub branch really moved.
+ */
+export function markPushed(git: GitState, plan: Pick<PushPlan, "repo" | "localBranch" | "branch" | "commits">, shas: string[], newTip: string | null): GitState {
+  if (!git.remote || git.remote.repo !== plan.repo) return git;
+  const known = { ...git.remote.shas };
+  plan.commits.forEach((commit, index) => {
+    if (shas[index]) known[commit.id] = shas[index];
   });
-  return { repo: remote.repo, branch, expectSha: known(newestOnGitHub(git)?.id) ?? null, commits };
+  const tips = { ...(git.remote.tips ?? {}) };
+  if (newTip) tips[plan.branch] = newTip;
+  return { ...git, remote: { ...git.remote, shas: known, tips, track: { ...git.remote.track, [plan.localBranch]: plan.branch } } };
 }
 
 // ---------- pull ----------
 
-/** A commit fetched from GitHub: changes relative to its first parent, paths relative to the repo root. */
-export type RemoteCommit = { sha: string; message: string; changes: FileChange[] };
+/** One path a pull brings: new text, null (deleted on GitHub), or unsupported (binary, too large, symlink…). */
+export type PullChange = { path: string; content: string | null; unsupported?: boolean };
 
 /**
- * Records fetched GitHub commits as local commits, replayed on top of the
- * local commit for `baseSha`. Paths go under the remote's folder. The
- * commits are not on a branch yet; returns the new tip to merge.
+ * Builds one local commit for a pull: the local tree of `baseId` (the commit
+ * for GitHub's last-seen tip) plus the net changes from that tip to GitHub's
+ * new tip, under the remote folder. A path GitHub now has in a form this app
+ * cannot hold is dropped from the snapshot, unless this branch changed it
+ * since the base, in which case the pull is refused (keeping our copy would
+ * later push it over GitHub's version).
  */
-export function replayRemote(git: GitState, baseSha: string, fetched: RemoteCommit[], time: string): { git: GitState; tip: string } | string {
+export function pullSnapshot(
+  git: GitState,
+  baseId: string,
+  tipSha: string,
+  changes: PullChange[],
+  message: string,
+  time: string,
+): { git: GitState; tip: string; dropped: string[] } | string {
   const remote = git.remote;
-  if (!remote) return "no remote";
-  const baseId = Object.entries(remote.shas).find(([, sha]) => sha === baseSha)?.[0];
   const base = byId(git, baseId);
-  if (!base) return "the last commit known to be on GitHub is no longer in local history; clone again";
+  if (!remote || !base) return "the commit GitHub was last seen at is not in local history; clone again";
   const prefix = remote.dir ? `${remote.dir}/` : "";
+  const headTreeNow = headTree(git);
+  const tree: Tree = { ...(base.tree ?? {}) };
   const blobs = { ...(git.blobs ?? {}) };
-  const shas = { ...remote.shas };
-  let commits = [...git.commits];
-  let parent = base;
-  for (const item of fetched) {
-    const tree: Tree = { ...(parent.tree ?? {}) };
-    for (const change of item.changes) {
-      const path = `${prefix}${change.path}`;
-      if (change.content === null) delete tree[path];
+  const dropped: string[] = [];
+  const refused: string[] = [];
+  for (const change of changes) {
+    const path = `${prefix}${change.path}`;
+    if (change.unsupported) {
+      if (!(path in tree)) continue; // not held here: GitHub keeps it as it is
+      if (headTreeNow[path] !== tree[path]) refused.push(path);
       else {
-        const id = hash(change.content);
-        blobs[id] = change.content;
-        tree[path] = id;
+        delete tree[path];
+        dropped.push(path);
       }
+      continue;
     }
-    const id = hash(`${parent.id}\n${item.sha}`).slice(0, 7);
-    const made: Commit = { id, message: item.message, time, parent: parent.id, tree };
-    if (!commits.some((commit) => commit.id === id)) commits = [made, ...commits];
-    shas[id] = item.sha;
-    parent = made;
+    if (change.content === null) delete tree[path];
+    else {
+      const id = hash(change.content);
+      blobs[id] = change.content;
+      tree[path] = id;
+    }
   }
-  return { git: { ...git, blobs, commits, remote: { ...remote, shas } }, tip: parent.id };
-}
-
-/** Records the GitHub shas a push created. */
-export function markPushed(git: GitState, localIds: string[], shas: string[], remoteBranch: string): GitState {
-  if (!git.remote) return git;
-  const known = { ...git.remote.shas };
-  localIds.forEach((id, index) => {
-    if (shas[index]) known[id] = shas[index];
-  });
-  return { ...git, remote: { ...git.remote, shas: known, track: { ...git.remote.track, [git.branch]: remoteBranch } } };
+  if (refused.length) {
+    return `GitHub changed ${refused.slice(0, 5).join(", ")} into something this app cannot copy (binary or too large), and this branch changed it too. Resolve it on GitHub, or restore your copy (git checkout ${baseId} -- <path>), then pull`;
+  }
+  const id = hash(`${baseId}\n${tipSha}`);
+  const made: Commit = { id, message, time, parent: baseId, tree };
+  const commits = git.commits.some((commit) => commit.id === id) ? git.commits : [made, ...git.commits];
+  return { git: { ...git, blobs, commits, remote: { ...remote, shas: { ...remote.shas, [id]: tipSha } } }, tip: id, dropped };
 }
 
 export function blob(git: GitState, id: string | undefined): string | undefined {

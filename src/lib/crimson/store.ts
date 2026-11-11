@@ -418,6 +418,8 @@ function persistable(state: OsState, slim: boolean) {
 
 /** The in-flight chat request, so Stop (and reset) can cancel it. */
 let chatAbort: AbortController | null = null;
+/** The GitHub operation in flight ("push", "pull" or "clone"), so two cannot interleave. */
+let githubBusy: string | null = null;
 
 export const useOs = create<OsState>((set, get) => ({
   booted: false,
@@ -641,21 +643,30 @@ export const useOs = create<OsState>((set, get) => ({
       say([`${ok ? (message.startsWith("Everything") ? "[INFO]" : "[SUCCESS]") : "[ERROR]"} ${message}`, ...extra]);
       return { ok, message };
     };
+    if (githubBusy) return done(false, `another GitHub operation (${githubBusy}) is still running`);
+    get().flushDraft();
     const git = Git.normalizeGit(get().git);
     const plan = Git.pushPlan(git);
     if (typeof plan === "string") return done(plan.startsWith("Everything"), plan);
-    say([`Pushing ${plan.commits.length} commit(s) to ${plan.repo} ${plan.branch}…`]);
-    let result: { ok: boolean; error?: string; shas?: string[]; url?: string; created?: boolean };
+    githubBusy = "push";
+    say([plan.moveTo ? `Moving ${plan.repo} ${plan.branch} to ${plan.moveTo.slice(0, 7)}…` : `Pushing ${plan.commits.length} commit(s) to ${plan.repo} ${plan.branch}…`]);
+    let result: { ok: boolean; error?: string; shas?: string[]; tip?: string; url?: string; created?: boolean; warning?: string };
     try {
       const response = await fetch("/api/git/push", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(plan) });
       result = await response.json();
     } catch {
+      githubBusy = null;
       return done(false, "The push request failed (network).");
     }
-    if (!result.ok || !result.shas) return done(false, result.error ?? "Push failed.");
-    // Record against the state as it is now (the user may have kept working).
-    set({ git: Git.markPushed(Git.normalizeGit(get().git), plan.commits.map((commit) => commit.id), result.shas, plan.branch) });
-    return done(true, `${result.created ? "Created" : "Updated"} ${plan.repo} ${plan.branch}: ${plan.commits.length} commit(s), now at ${result.shas.at(-1)?.slice(0, 7)}`, [`[INFO] ${result.url}`]);
+    githubBusy = null;
+    // Record against the branches the plan was made for, not whatever is current now.
+    // markPushed ignores the result if the remote was removed or replaced meanwhile.
+    if (result.shas?.length || (result.ok && result.tip)) {
+      set({ git: Git.markPushed(Git.normalizeGit(get().git), plan, result.shas ?? [], result.ok ? (result.tip ?? null) : null) });
+    }
+    if (!result.ok) return done(false, result.error ?? "Push failed.");
+    const what = plan.moveTo ? `moved to ${plan.moveTo.slice(0, 7)}` : `${plan.commits.length} commit(s), now at ${result.tip?.slice(0, 7)}`;
+    return done(true, `${result.created ? "Created" : "Updated"} ${plan.repo} ${plan.branch}: ${what}`, [`[INFO] ${result.url}`, ...(result.warning ? [`[WARN] ${result.warning}`] : [])]);
   },
   gitPull: async () => {
     const say = (lines: string[]) => get().pushTerminal(lines);
@@ -663,44 +674,56 @@ export const useOs = create<OsState>((set, get) => ({
       say([`[ERROR] ${message}`]);
       return { ok: false, message };
     };
+    if (githubBusy) return fail(`another GitHub operation (${githubBusy}) is still running`);
     get().flushDraft();
     const git = Git.normalizeGit(get().git);
     const remote = git.remote;
     if (!remote) return fail("no remote to pull from");
-    const base = Git.newestOnGitHub(git);
-    if (!base) return fail(`nothing on this branch is known to be on GitHub yet; push it first, or clone ${remote.repo} again`);
-    const work = Git.workingFiles(get().files);
-    const pending = Git.dirty(git, work);
+    const branch = Git.remoteBranchOf(git);
+    const baseSha = remote.tips?.[branch];
+    if (!baseSha) return fail(`GitHub's ${branch} has not been seen by this project yet: push it first, or clone ${remote.repo} again`);
+    const baseId = Git.localIdOf(git, baseSha);
+    if (!baseId) return fail(`the commit GitHub's ${branch} was last seen at is no longer in local history; clone ${remote.repo} again`);
+    const pending = Git.dirty(git, Git.workingFiles(get().files));
     if (pending.length) return fail(`commit or restore your changes first: ${pending.slice(0, 5).join(", ")}`);
-    const branch = remote.track[git.branch] ?? git.branch;
+    // Pin what the pull started on; a result for a different state is thrown away.
+    const started = { repo: remote.repo, branch: git.branch, head: Git.headCommit(git)?.id };
+    githubBusy = "pull";
     say([`Pulling ${remote.repo} ${branch}…`]);
-    let result: { ok: boolean; error?: string; note?: string; commits?: (Git.RemoteCommit & { skipped: string[] })[] };
+    let result: { ok: boolean; error?: string; note?: string; tip?: string; ahead?: number; subjects?: string[]; changes?: Git.PullChange[] };
     try {
-      const response = await fetch("/api/git/fetch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: remote.repo, branch, base: remote.shas[base.id] }) });
+      const response = await fetch("/api/git/fetch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo: remote.repo, branch, base: baseSha }) });
       result = await response.json();
     } catch {
+      githubBusy = null;
       return fail("The pull request failed (network).");
     }
-    if (!result.ok || !result.commits) return fail(result.error ?? "Pull failed.");
-    if (result.commits.length === 0) {
+    githubBusy = null;
+    if (!result.ok || !result.changes || !result.tip) return fail(result.error ?? "Pull failed.");
+    const now = Git.normalizeGit(get().git);
+    if (now.remote?.repo !== started.repo || now.branch !== started.branch || Git.headCommit(now)?.id !== started.head || now.merging) {
+      return fail("the project changed while pulling (branch, commit or remote); nothing was applied. Run git pull again");
+    }
+    if (result.tip === baseSha) {
       const message = result.note ?? "Already up to date.";
       say([`[INFO] ${message}`]);
       return { ok: true, message };
     }
-    // The user may have kept working while the request ran.
-    const now = Git.normalizeGit(get().git);
     const time = new Date().toLocaleString();
-    const replayed = Git.replayRemote(now, remote.shas[base.id], result.commits, time);
-    if (typeof replayed === "string") return fail(replayed);
-    const merged = Git.mergeInto(replayed.git, Git.workingFiles(get().files), replayed.tip, `Merge ${remote.repo} ${branch} into ${now.branch}`, time);
+    const subjects = result.subjects ?? [];
+    const message = `Pull ${result.ahead ?? "?"} commit(s) from ${remote.repo} ${branch}${subjects.length ? `: ${subjects.slice(0, 3).join("; ")}${subjects.length > 3 ? "; …" : ""}` : ""}`;
+    const snapshot = Git.pullSnapshot(now, baseId, result.tip, result.changes, message, time);
+    if (typeof snapshot === "string") return fail(snapshot);
+    const merged = Git.mergeInto(snapshot.git, Git.workingFiles(get().files), snapshot.tip, `Merge ${remote.repo} ${branch} into ${now.branch}`, time);
     if (typeof merged === "string") return fail(merged);
-    const view = mergeLines(now, merged);
-    if (view.effect?.type === "git") get().applyGit(view.effect.git, view.effect.changes);
-    const skipped = result.commits.flatMap((item) => item.skipped);
+    // GitHub's branch is now known to be at the fetched tip.
+    const withTip = merged.git.remote ? { ...merged.git, remote: { ...merged.git.remote, tips: { ...(merged.git.remote.tips ?? {}), [branch]: result.tip } } } : merged.git;
+    const view = mergeLines(now, { ...merged, git: withTip });
+    get().applyGit(withTip, merged.changes);
     say([
-      `[INFO] Fetched ${result.commits.length} commit(s): ${result.commits.map((item) => item.message.split("\n")[0]).slice(0, 3).join("; ")}${result.commits.length > 3 ? "; …" : ""}`,
+      `[INFO] Fetched ${result.ahead ?? "?"} commit(s) from GitHub${subjects.length ? `: ${subjects.slice(0, 3).join("; ")}${subjects.length > 3 ? "; …" : ""}` : ""}`,
       ...view.lines,
-      ...(skipped.length ? [`[INFO] Not copied (binary or too large; left as they are here): ${[...new Set(skipped)].slice(0, 5).join(", ")}`] : []),
+      ...(snapshot.dropped.length ? [`[INFO] Removed here because GitHub's new version cannot be copied (binary or too large); it stays on GitHub: ${snapshot.dropped.slice(0, 5).join(", ")}`] : []),
     ]);
     return { ok: merged.conflicts.length === 0, message: merged.note };
   },
@@ -711,18 +734,27 @@ export const useOs = create<OsState>((set, get) => ({
       error?: string;
       files?: { path: string; content: string }[];
       skipped?: Record<string, number>;
-      /** Set when the server has a token: the copy can be linked for push. */
+      /** Set when the server has a token and the repo is allowed: the copy can be linked for push. */
       linked?: boolean;
+      /** The server has a token but the repo is not on GITHUB_REPOS. */
+      notAllowed?: boolean;
       sha?: string;
       branch?: string;
       private?: boolean;
     };
+    if (githubBusy) {
+      say([`[ERROR] another GitHub operation (${githubBusy}) is still running`]);
+      return;
+    }
+    githubBusy = "clone";
     try {
       const response = await fetch("/api/clone", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repo }) });
       result = await response.json();
     } catch {
       say(["[ERROR] The clone request failed (network)."]);
       return;
+    } finally {
+      githubBusy = null;
     }
     if (!result.ok || !result.files) {
       say([`[ERROR] ${result.error ?? "Clone failed."}`]);
@@ -765,23 +797,30 @@ export const useOs = create<OsState>((set, get) => ({
       ...(skipped.length ? [`[INFO] left out: ${skipped.join(", ")}. They stay on GitHub untouched when you push.`] : []),
     ];
     const git = Git.normalizeGit(get().git);
-    if (result.linked && result.sha && result.branch && !git.remote) {
+    if (result.linked && result.sha && result.branch && !git.remote && !git.merging) {
       // Record the copy as a commit that is already on GitHub, so later commits push on top of it.
+      // Only the cloned paths go into it; anything else the user staged stays staged.
       const dir = Git.pathOf(additions[0], files);
-      const paths = Object.keys(Git.workingFiles(files)).filter((path) => path.startsWith(`${dir}/`));
-      const staged = Git.add(git.initialized ? git : Git.init(git), Git.workingFiles(files), paths).git;
-      const committed = Git.commit(staged, `Clone of ${repo} at ${result.sha.slice(0, 7)}`, new Date().toLocaleString()) ?? staged;
-      const head = Git.headCommit(committed);
-      const linked = Git.setRemote(committed, repo, dir, { [committed.branch]: result.branch }, head ? { [head.id]: result.sha } : {});
-      set({ git: linked });
-      lines.push(
-        `[INFO] Linked: project/${dir}/ pushes to ${repo} (${committed.branch} → ${result.branch}). Commit there, then git push.`,
-        "[INFO] git pull brings in changes made on GitHub; git push sends yours.",
-      );
+      const cloned = Object.fromEntries(Object.entries(Git.workingFiles(files)).filter(([path]) => path.startsWith(`${dir}/`)));
+      const committed = Git.commitFiles(git.initialized ? git : Git.init(git), cloned, `Clone of ${repo} at ${result.sha.slice(0, 7)}`, new Date().toLocaleString());
+      if (typeof committed === "string") {
+        lines.push(`[INFO] A plain copy: ${committed}.`);
+      } else {
+        const head = Git.headCommit(committed)!;
+        set({ git: Git.setRemote(committed, repo, dir, { [committed.branch]: result.branch }, { [head.id]: result.sha }, { [result.branch]: result.sha }) });
+        lines.push(
+          `[INFO] Linked: project/${dir}/ pushes to ${repo} (${committed.branch} → ${result.branch}). Commit there, then git push.`,
+          "[INFO] git pull brings in changes made on GitHub; git push sends yours.",
+        );
+      }
+    } else if (result.linked && git.merging) {
+      lines.push("[INFO] A plain copy: a merge is in progress, so the clone was not linked. Finish or abort the merge and clone again to link it.");
     } else if (result.linked && git.remote) {
       lines.push(`[INFO] A plain copy: this project already pushes to ${git.remote.repo} (one remote per project).`);
+    } else if (result.notAllowed) {
+      lines.push(`[INFO] A plain copy: ${repo} is not on the server's GITHUB_REPOS list, so the token was not used and the copy is not linked.`);
     } else {
-      lines.push("[INFO] A plain copy with no link back. Set GITHUB_TOKEN on the server to link clones for push (and to clone private repos).");
+      lines.push("[INFO] A plain copy with no link back. Set GITHUB_TOKEN and GITHUB_REPOS on the server to link clones for push (and to clone private repos).");
     }
     say(lines);
   },
