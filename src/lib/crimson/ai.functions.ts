@@ -1,5 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
-import { completionBody, NO_PROVIDER_ERROR, normalizeChatInput, upstreamError } from "./chat-input";
+import { completionBody, NO_PROVIDER_ERROR, normalizeChatInput, upstreamError, withoutTools } from "./chat-input";
 import type { ProviderConfig } from "./providers.server";
 
 /*
@@ -35,7 +35,8 @@ export const lockAccess = createServerFn({ method: "POST" }).handler(async () =>
 
 export const askCrimson = createServerFn({ method: "POST" })
   .validator((input: { messages: { role: string; content: string }[]; system: string; fast?: boolean; provider?: string }) =>
-    normalizeChatInput(input),
+    // Tools are chat-only: the terminal's ai never offers them.
+    withoutTools(normalizeChatInput(input)),
   )
   .handler(async ({ data }) => {
     const { guardAiCall } = await import("./access.server");

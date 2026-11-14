@@ -1,12 +1,16 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { completionBody, NO_PROVIDER_ERROR, normalizeChatInput, upstreamError, type ChatInput } from "@/lib/crimson/chat-input";
+import { completionBody, NO_PROVIDER_ERROR, normalizeChatInput, rejectsTools, upstreamError, withoutTools, type ChatInput } from "@/lib/crimson/chat-input";
+import { contentText, messageToolCalls, sseEvents, type UpstreamEvent } from "@/lib/crimson/sse";
 import type { ProviderConfig } from "@/lib/crimson/providers.server";
 
 /**
  * POST /api/chat — streams a chat reply as NDJSON lines:
  *   {"t":"delta","v":"text"}   a piece of the reply
  *   {"t":"done","provider":"…","model":"…","cut":true?}   cut = stopped at the token limit
- *   {"t":"note","v":"…"}       a provider failed first and another answered
+ *   {"t":"tool","calls":[{id,name,arguments}]}   the model asks for tools (the browser runs them
+ *                              and sends the results in the next request)
+ *   {"t":"note","v":"…"}       a provider failed first and another answered, or refused tools
+ * `done` carries noTools:true when the provider refused tools and answered without them.
  *   {"t":"error","v":"message"}
  * Same access key, rate limit and provider selection as askCrimson. If the
  * chosen provider fails before any text arrives, the next configured one is
@@ -14,7 +18,8 @@ import type { ProviderConfig } from "@/lib/crimson/providers.server";
  * When the browser aborts (Stop button), the upstream request is cancelled
  * too, so the provider stops generating (and billing).
  */
-const MAX_BODY_BYTES = 128 * 1024;
+/** Room for a few rounds of tool results on top of the conversation. */
+const MAX_BODY_BYTES = 256 * 1024;
 
 const encoder = new TextEncoder();
 
@@ -47,7 +52,7 @@ async function handle(request: Request): Promise<Response> {
   } catch {
     return single({ t: "error", v: "Bad request." }, 400);
   }
-  const input = normalizeChatInput(parsed);
+  let input = normalizeChatInput(parsed);
   if (input.messages.length === 0) return single({ t: "error", v: "Empty directive." });
 
   const first = resolveProvider(input.provider);
@@ -56,10 +61,19 @@ async function handle(request: Request): Promise<Response> {
   // One budget for all attempts, so a fallback cannot double the wait.
   const signal = AbortSignal.any([request.signal, AbortSignal.timeout(120_000)]);
   const failures: string[] = [];
+  const notes: string[] = [];
+  let noTools = false;
   for (const provider of fallbackOrder(first)) {
     if (request.signal.aborted) return new Response(null, { status: 204 });
-    const attempt = await open(provider, input, signal, caps);
-    if (attempt.ok) return respond(attempt, provider, failures, request);
+    let attempt = await open(provider, input, signal, caps);
+    if (!attempt.ok && attempt.toolsRejected) {
+      // This model cannot take tools: ask again without them (and keep it that way for any fallback).
+      input = withoutTools(input);
+      noTools = true;
+      notes.push(`${provider.label} cannot use tools, so it answered without them.`);
+      attempt = await open(provider, input, signal, caps);
+    }
+    if (attempt.ok) return respond(attempt, provider, failures, request, notes, noTools);
     // Browser already gone (Stop before any provider answered): nothing to send.
     if (request.signal.aborted) return new Response(null, { status: 204 });
     failures.push(attempt.error);
@@ -67,9 +81,6 @@ async function handle(request: Request): Promise<Response> {
   }
   return single({ t: "error", v: failures.join(" ") });
 }
-
-/** One parsed SSE event from an OpenAI-compatible stream. */
-type UpstreamEvent = { piece?: string; error?: string; model?: string; finish?: string };
 
 type Attempt =
   | { ok: true; buffered: UpstreamEvent[]; events: AsyncGenerator<UpstreamEvent>; model: string }
@@ -79,6 +90,8 @@ type Attempt =
       timedOut?: boolean;
       /** The model answered, but spent its whole budget thinking: another provider would only repeat that, so stop. */
       final?: boolean;
+      /** The provider refused the request because of its tools field. */
+      toolsRejected?: boolean;
     };
 
 /**
@@ -102,23 +115,31 @@ async function open(provider: ProviderConfig, input: ChatInput, signal: AbortSig
     const timedOut = error instanceof DOMException && error.name === "TimeoutError";
     return { ok: false, error: timedOut ? `${provider.label} timed out.` : `Could not reach ${provider.label}.`, timedOut };
   }
-  if (!upstream.ok || !upstream.body) return { ok: false, error: await upstreamError(provider.label, upstream) };
+  if (!upstream.ok || !upstream.body) {
+    const error = await upstreamError(provider.label, upstream);
+    return { ok: false, error, toolsRejected: rejectsTools(input, upstream.status, error) };
+  }
 
   // Some gateways ignore stream:true and answer with one JSON body.
   if (!(upstream.headers.get("content-type") ?? "").includes("text/event-stream")) {
     const body = (await upstream.json().catch(() => ({}))) as {
-      choices?: { message?: { content?: unknown }; finish_reason?: string }[];
+      choices?: { message?: { content?: unknown; tool_calls?: unknown }; finish_reason?: string }[];
       model?: string;
       error?: { message?: string } | string;
     };
     const text = contentText(body.choices?.[0]?.message?.content).trim();
+    const calls = messageToolCalls(body.choices?.[0]?.message?.tool_calls);
+    if (!text && calls.length) {
+      const only: UpstreamEvent = { calls, model: body.model ?? model, finish: "tool_calls" };
+      return { ok: true, buffered: [only], events: (async function* () {})(), model: body.model ?? model };
+    }
     if (!text) {
       const detail = typeof body.error === "string" ? body.error : body.error?.message;
       if (detail) return { ok: false, error: `${provider.label}: ${String(detail).slice(0, 200)}` };
       if (body.choices?.[0]?.finish_reason === "length") return { ok: false, error: `${provider.label} (${body.model ?? model}) spent its whole token budget thinking and wrote no answer. Try Precise, or ask again.`, final: true };
       return { ok: false, error: `${provider.label} returned an empty reply.` };
     }
-    const only: UpstreamEvent = { piece: text, model: body.model ?? model, finish: body.choices?.[0]?.finish_reason ?? "" };
+    const only: UpstreamEvent = { piece: text, model: body.model ?? model, finish: body.choices?.[0]?.finish_reason ?? "", ...(calls.length ? { calls } : {}) };
     return { ok: true, buffered: [only], events: (async function* () {})(), model: body.model ?? model };
   }
 
@@ -142,7 +163,7 @@ async function open(provider: ProviderConfig, input: ChatInput, signal: AbortSig
         return { ok: false, error: `${provider.label}: ${event.error.slice(0, 200)}` };
       }
       buffered.push(event);
-      if (event.piece) return { ok: true, buffered, events, model: servedModel };
+      if (event.piece || event.calls?.length) return { ok: true, buffered, events, model: servedModel };
     }
   } catch (error) {
     const timedOut = error instanceof DOMException && error.name === "TimeoutError";
@@ -151,7 +172,7 @@ async function open(provider: ProviderConfig, input: ChatInput, signal: AbortSig
 }
 
 /** Streams a successful attempt to the browser as NDJSON. */
-function respond(attempt: Extract<Attempt, { ok: true }>, provider: ProviderConfig, failures: string[], request: Request): Response {
+function respond(attempt: Extract<Attempt, { ok: true }>, provider: ProviderConfig, failures: string[], request: Request, notes: string[], noTools: boolean): Response {
   const stream = new ReadableStream<Uint8Array<ArrayBuffer>>({
     async pull(controller) {
       let servedModel = attempt.model;
@@ -161,16 +182,16 @@ function respond(attempt: Extract<Attempt, { ok: true }>, provider: ProviderConf
         if (event.model) servedModel = event.model;
         if (event.finish) finish = event.finish;
         if (event.error) return safe(() => controller.enqueue(line({ t: "error", v: `${provider.label}: ${event.error!.slice(0, 200)}` })));
-        if (event.piece) return safe(() => controller.enqueue(line({ t: "delta", v: event.piece })));
+        if (event.piece && !safe(() => controller.enqueue(line({ t: "delta", v: event.piece })))) return false;
+        if (event.calls?.length) return safe(() => controller.enqueue(line({ t: "tool", calls: event.calls })));
         return true;
       };
       try {
-        if (failures.length > 0) {
-          safe(() => controller.enqueue(line({ t: "note", v: `Answered by ${provider.label}. ${failures.join(" ")}` })));
-        }
+        const note = [...(failures.length > 0 ? [`Answered by ${provider.label}. ${failures.join(" ")}`] : []), ...notes].join(" ");
+        if (note) safe(() => controller.enqueue(line({ t: "note", v: note })));
         for (const event of attempt.buffered) if (!emit(event)) return;
         for await (const event of attempt.events) if (!emit(event)) return;
-        safe(() => controller.enqueue(line({ t: "done", provider: provider.id, model: servedModel, cut: finish === "length" })));
+        safe(() => controller.enqueue(line({ t: "done", provider: provider.id, model: servedModel, cut: finish === "length", ...(noTools ? { noTools: true } : {}) })));
       } catch {
         if (!request.signal.aborted) safe(() => controller.enqueue(line({ t: "error", v: `${provider.label} stream dropped.` })));
       } finally {
@@ -189,51 +210,6 @@ function respond(attempt: Extract<Attempt, { ok: true }>, provider: ProviderConf
   });
 }
 
-/** Parses an OpenAI-compatible SSE body into events; cancels the body if the consumer stops early. */
-async function* sseEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<UpstreamEvent> {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) return;
-      buffer += decoder.decode(value, { stream: true });
-      let cut: number;
-      while ((cut = buffer.indexOf("\n")) !== -1) {
-        const row = buffer.slice(0, cut).trim();
-        buffer = buffer.slice(cut + 1);
-        if (!row.startsWith("data:")) continue;
-        const data = row.slice(5).trim();
-        if (data === "[DONE]") continue;
-        let chunk: {
-          model?: string;
-          error?: { message?: string } | string;
-          choices?: { delta?: { content?: unknown }; finish_reason?: string | null }[];
-        };
-        try {
-          chunk = JSON.parse(data);
-        } catch {
-          continue; // keep-alive or malformed row
-        }
-        if (chunk.error) {
-          const message = typeof chunk.error === "string" ? chunk.error : chunk.error.message;
-          yield { error: String(message ?? "stream error") };
-          continue;
-        }
-        const reason = chunk.choices?.[0]?.finish_reason;
-        yield {
-          model: chunk.model,
-          finish: typeof reason === "string" && reason ? reason : undefined,
-          piece: contentText(chunk.choices?.[0]?.delta?.content) || undefined,
-        };
-      }
-    }
-  } finally {
-    reader.cancel().catch(() => {});
-  }
-}
-
 /** Stream controller calls throw once the browser has disconnected; report instead. */
 function safe(fn: () => void): boolean {
   try {
@@ -242,16 +218,6 @@ function safe(fn: () => void): boolean {
   } catch {
     return false;
   }
-}
-
-function contentText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => (part && typeof part === "object" && (part as { type?: string }).type === "text" ? String((part as { text?: string }).text ?? "") : ""))
-      .join("");
-  }
-  return "";
 }
 
 export const Route = createFileRoute("/api/chat")({
