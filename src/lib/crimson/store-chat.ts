@@ -5,8 +5,10 @@ import { activePersonality, historyForModel, systemPrompt, terminalPrompt } from
 import { languageFromName } from "./seed";
 import { session, type StoreApi } from "./store-shared";
 import type { OsState } from "./store";
-import { streamChat } from "./stream-chat";
-import type { ChatMessage, ProjectFile } from "./types";
+import { streamChat, type StreamResult, type WireMessage } from "./stream-chat";
+import { CHAT_TOOLS, MAX_TOOL_ROUNDS, TOOLS_RULE, toolsOn } from "./tools";
+import { runReadRound } from "./tools-run";
+import type { ChatMessage, ProjectFile, ToolUse } from "./types";
 
 export function chatActions(
   get: StoreApi["get"],
@@ -46,10 +48,51 @@ export function chatActions(
         );
         set({ chat: [...chat, ...extra] });
       };
-      const result = await streamChat(
-        { messages, system: system.prompt, fast: get().fast && !fileMatch, provider: get().provider },
-        { signal: controller.signal, onDelta: (textSoFar) => patchReply({ text: textSoFar }), onNote: (note) => patchReply({ note }) },
-      );
+      // Tool rounds: the model may ask for tools; they run here and the results go back, up to MAX_TOOL_ROUNDS.
+      const useTools = toolsOn(activePersonality(get().personalities)) && !fileMatch;
+      let offered = useTools;
+      const wire: WireMessage[] = [...messages];
+      const uses: ToolUse[] = [];
+      const earlier: string[] = [];
+      const notes: string[] = [];
+      const shown = (latest: string) => [...earlier, latest].filter((part) => part.trim()).join("\n\n");
+      let result: StreamResult;
+      for (let round = 0; ; round++) {
+        const last = round >= MAX_TOOL_ROUNDS;
+        result = await streamChat(
+          {
+            messages: wire,
+            system: system.prompt + (useTools ? TOOLS_RULE : ""),
+            fast: get().fast && !fileMatch,
+            provider: get().provider,
+            // On the last round the tools stay listed (the history holds tool messages) but the model must answer.
+            ...(offered ? { tools: [...CHAT_TOOLS], toolChoice: last ? ("none" as const) : ("auto" as const) } : {}),
+          },
+          {
+            signal: controller.signal,
+            onDelta: (textSoFar) => patchReply({ text: shown(textSoFar) }),
+            onNote: (note) => {
+              if (!notes.includes(note)) notes.push(note);
+              patchReply({ note: notes.join(" ") });
+            },
+          },
+        );
+        if (startedIn !== session.generation) return;
+        if (!result.ok) break;
+        if (result.noTools) offered = false;
+        if (!result.calls?.length || !offered || last) break;
+        const state = get();
+        const outcomes = runReadRound({ files: state.files, activeFileId: state.activeFileId, draft: state.draft, packs: state.packs }, result.calls, CHAT_TOOLS);
+        uses.push(...outcomes.map((outcome) => outcome.use));
+        if (result.text.trim()) earlier.push(result.text.trim());
+        wire.push({ role: "assistant", content: result.text, tool_calls: result.calls }, ...outcomes.map((outcome) => outcome.message));
+        patchReply({ text: shown(""), tools: [...uses] });
+      }
+      const toolsPatch = uses.length ? { tools: uses } : {};
+      if (result.ok && !shown(result.text).trim()) {
+        // Still asking for tools after the last round, with nothing written.
+        result = { ok: false, text: "", error: `The model used all ${MAX_TOOL_ROUNDS} tool rounds without writing an answer. Ask again, more narrowly.` };
+      }
       if (session.chatAbort === controller) session.chatAbort = null;
 
       if (startedIn !== session.generation) return; // the workspace was reset or replaced while the reply streamed
@@ -72,11 +115,11 @@ export function chatActions(
         return;
       }
       if (result.ok) {
-        patchReply({ text: result.text, pending: false, ...(result.cut ? { cut: true } : {}) });
-      } else if (result.text.trim()) {
-        // Keep what arrived; flag the cut or add the error as a separate notice.
+        patchReply({ text: shown(result.text), pending: false, ...toolsPatch, ...(result.cut ? { cut: true } : {}) });
+      } else if (shown(result.text).trim() || uses.length) {
+        // Keep what arrived (and the tools used); flag the cut or add the error as a separate notice.
         patchReply(
-          { text: result.text, pending: false, stopped: result.stopped === true },
+          { text: shown(result.text), pending: false, stopped: result.stopped === true, ...toolsPatch },
           result.stopped ? [] : [{ role: "ai", text: result.error, timestamp: Date.now(), error: true }],
         );
       } else {

@@ -26,6 +26,21 @@ export type Personality = {
   suggestions: string[];
   /** Skill ids from skills/catalog.ts applied in this mode. */
   skills?: string[];
+  /** Chat tools on in this mode. Unset: the default for the mode (see toolsOn in tools.ts). */
+  tools?: boolean;
+};
+
+/** One tool call made while writing a reply, as shown under it. */
+export type ToolUse = {
+  id: string;
+  name: string;
+  /** The call's arguments, as the model sent them (shortened). */
+  args: string;
+  /** The chip label, e.g. "Read src/app.py · lines 1–42". */
+  summary: string;
+  /** What was sent back to the model (shortened for saving). */
+  result: string;
+  status: "done" | "error";
 };
 
 export type ChatMessage = {
@@ -48,6 +63,8 @@ export type ChatMessage = {
   cut?: boolean;
   /** The app's welcome line: shown, but never sent to the model or handed off. */
   intro?: boolean;
+  /** Tools the model used while writing this reply, in order. */
+  tools?: ToolUse[];
 };
 
 export type Pack = {

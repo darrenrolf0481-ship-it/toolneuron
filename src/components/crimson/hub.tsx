@@ -11,12 +11,13 @@ import {
   ShieldCheck,
   Square,
   Trash2,
+  Wrench,
 } from "lucide-react";
 import { analyzeSource } from "@/lib/crimson/analyze";
 import { findHandoff, handoffFrom } from "@/lib/crimson/handoff";
 import { MAX_PACK_CHARS, packText, sections } from "@/lib/crimson/knowledge";
 import { useOs } from "@/lib/crimson/store";
-import type { Module } from "@/lib/crimson/types";
+import type { Module, ToolUse } from "@/lib/crimson/types";
 import { Rich } from "./rich";
 import { SwarmPane } from "./swarm-pane";
 import { VaultPane } from "./vault-pane";
@@ -101,7 +102,11 @@ function ChatPane() {
       </header>
       <div className="os-scroll flex-1 space-y-3 overflow-y-auto px-4 py-4" role="log" aria-live="polite" aria-label="Chat">
         {chat.map((message, index) => (
-          <div key={`${message.timestamp}-${message.role}-${index}`} className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}>
+          <div
+            key={`${message.timestamp}-${message.role}-${index}`}
+            data-message={message.error ? "notice" : message.role}
+            className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
+          >
             <div
               role={message.error ? "status" : undefined}
               className={`max-w-[92%] rounded-3xl px-4 py-3 ${message.role === "user" ? "bg-primary text-on-primary" : message.error ? "border border-dashed border-primary/60 text-muted" : "border border-border bg-surface-2 text-fg"}`}
@@ -110,7 +115,12 @@ function ChatPane() {
                 <p className="text-xs leading-5 tracking-wide">⚠ {message.text}</p>
               ) : message.role === "ai" ? (
                 <>
-                  {message.text ? <Rich text={message.text} /> : <p className="text-sm text-muted">…</p>}
+                  {message.text ? (
+                    <Rich text={message.text} />
+                  ) : (
+                    <p className="text-sm text-muted">{message.pending && message.tools?.length ? "Looking at the project…" : "…"}</p>
+                  )}
+                  {message.tools && message.tools.length > 0 && <ToolChips uses={message.tools} />}
                   {message.pending && message.text && <span className="os-caret" aria-hidden />}
                   {message.stopped && <p className="mt-1 text-[11px] tracking-wide text-muted uppercase">Stopped</p>}
                   {message.note && (
@@ -234,6 +244,30 @@ function ChatPane() {
         )}
       </form>
     </div>
+  );
+}
+
+/** What the model's tools did while writing a reply; tap a chip for the arguments and the result it was sent. */
+function ToolChips({ uses }: { uses: ToolUse[] }) {
+  return (
+    <ul className="mt-2 flex flex-col gap-1" aria-label="Tools used">
+      {uses.map((use) => (
+        <li key={use.id}>
+          <details className="group rounded-2xl border border-border bg-bg text-[11px]">
+            <summary className={`flex min-h-8 cursor-pointer list-none items-center gap-1.5 px-3 py-1 tracking-wide ${use.status === "error" ? "text-primary" : "text-muted"}`}>
+              <Wrench className="h-3 w-3 shrink-0" aria-hidden />
+              <span className="min-w-0 truncate">{use.summary}</span>
+            </summary>
+            <div className="space-y-1 border-t border-border px-3 py-2 font-mono text-[11px] leading-4 text-muted">
+              <p className="break-all">
+                {use.name}({use.args || ""})
+              </p>
+              <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words text-fg">{use.result}</pre>
+            </div>
+          </details>
+        </li>
+      ))}
+    </ul>
   );
 }
 

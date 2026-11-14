@@ -7,11 +7,13 @@ import {
   LayoutTemplate,
   Settings,
   Terminal,
+  Wrench,
   Zap,
 } from "lucide-react";
 import { listAiProviders } from "@/lib/crimson/ai.functions";
 import { type Access, AccessControl } from "./access-control";
 import { bootPersistence, useOs } from "@/lib/crimson/store";
+import { toolsOn } from "@/lib/crimson/tools";
 import type { Tab } from "@/lib/crimson/types";
 import { AnalysisView } from "./analysis-view";
 import { EditorView } from "./editor-view";
@@ -124,6 +126,7 @@ function TopBar() {
   const setFast = useOs((state) => state.setFast);
   const provider = useOs((state) => state.provider);
   const setProvider = useOs((state) => state.setProvider);
+  const setModeTools = useOs((state) => state.setModeTools);
   const [providers, setProviders] = useState<{ id: string; label: string; model: string; fastModel: string }[]>([]);
   const [defaultProvider, setDefaultProvider] = useState<string | null>(null);
   const [access, setAccess] = useState<Access>("locked");
@@ -180,6 +183,19 @@ function TopBar() {
             ))}
           </select>
         </label>
+        {active && (
+          <button
+            type="button"
+            aria-pressed={toolsOn(active)}
+            aria-label="Chat tools"
+            onClick={() => setModeTools(active.id, !toolsOn(active))}
+            title={toolsOn(active) ? `Tools on for ${active.name}: chat can list, read and search project files and packs` : `Tools off for ${active.name}`}
+            className={`flex items-center gap-1 rounded-full border px-2.5 py-2 text-xs font-semibold tracking-wide sm:px-3 ${toolsOn(active) ? "border-primary text-primary" : "border-border text-muted"}`}
+          >
+            <Wrench className="h-3.5 w-3.5" aria-hidden />
+            <span className="hidden sm:inline">Tools</span>
+          </button>
+        )}
         <button
           type="button"
           onClick={() => setFast(!fast)}

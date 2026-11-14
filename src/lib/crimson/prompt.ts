@@ -7,6 +7,7 @@
 import { findHandoff, HANDOFF_NAME, handoffBlock, labelHistory } from "./handoff.ts";
 import { knowledgeBlock, retrieve } from "./knowledge.ts";
 import { DEFAULT_SKILLS, pickSkills, skillsBlock } from "./skills/catalog.ts";
+import { toolsLine } from "./tools.ts";
 import type { ChatMessage, Pack, Personality, ProjectFile } from "./types.ts";
 
 /** The slice of app state the prompts read. */
@@ -163,7 +164,9 @@ export function terminalPrompt(state: PromptState, question: string, cwd: string
 export function historyForModel(history: ChatMessage[], currentMode: string) {
   const kept = history
     .filter((message, index) => !message.error && !message.intro && !(message.role === "user" && history[index + 1]?.error))
-    .slice(-HISTORY_LIMIT);
+    .slice(-HISTORY_LIMIT)
+    // A finished reply's tool traffic is not resent: one line says what it looked at.
+    .map((message) => (message.tools?.length ? { ...message, text: message.text + toolsLine(message.tools) } : message));
   return labelHistory(kept, currentMode);
 }
 

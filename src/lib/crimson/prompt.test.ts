@@ -120,6 +120,11 @@ describe("historyForModel", () => {
     );
     assert.deepEqual(out.map((m) => m.content), ["plan it", "[Reply from Architect mode]\n1. guard", "do step 1"]);
   });
+  it("a finished reply's tools become one line, not resent traffic", () => {
+    const use = { id: "c1", name: "read_file", args: "{}", summary: "Read src/app.py · 3 lines", result: "…", status: "done" as const };
+    const out = historyForModel([msg("user", "what does app.py do?"), msg("ai", "It averages.", { tools: [use] })], "x");
+    assert.equal(out[1].content, "It averages.\n[Tools used: read src/app.py]");
+  });
   it("keeps only the last 8", () => {
     const many = Array.from({ length: 20 }, (_, i) => msg(i % 2 ? "ai" : "user", `m${i}`));
     assert.deepEqual(historyForModel(many, "x").map((m) => m.content)[0], "m12");

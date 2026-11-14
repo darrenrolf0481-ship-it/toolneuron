@@ -90,6 +90,8 @@ export type OsState = {
   addPersonality: (name: string, instruction: string, suggestions?: string[], skills?: string[]) => void;
   updatePersonality: (id: number, patch: { name: string; instruction: string; suggestions: string[]; skills?: string[] }) => void;
   removePersonality: (id: number) => void;
+  /** Turns chat tools on or off for one mode (remembered per mode). */
+  setModeTools: (id: number, on: boolean) => void;
   openFile: (id: string) => void;
   toggleFolder: (id: string) => void;
   flushDraft: () => void;
@@ -206,6 +208,8 @@ export const useOs = create<OsState>((set, get) => ({
     if (!next.some((item) => item.active)) next[0] = { ...next[0], active: true };
     set({ personalities: next });
   },
+
+  setModeTools: (id, on) => set({ personalities: get().personalities.map((item) => (item.id === id ? { ...item, tools: on } : item)) }),
 
   flushDraft: () => {
     const { files, activeFileId, draft } = get();

@@ -1,12 +1,30 @@
 import type { ChatInput } from "./chat-input";
+import type { ToolCall } from "./tools";
+
+/** A message as sent to /api/chat: plain turns, or the tool traffic of the current reply. */
+export type WireMessage = { role: string; content: string; tool_calls?: ToolCall[]; tool_call_id?: string };
 
 export type StreamResult =
-  | { ok: true; text: string; model?: string; /** Provider id that answered. */ provider?: string; /** Hit the token limit mid-reply. */ cut?: boolean; /** Another provider answered after the chosen one failed. */ note?: string }
+  | {
+      ok: true;
+      text: string;
+      model?: string;
+      /** Provider id that answered. */
+      provider?: string;
+      /** Hit the token limit mid-reply. */
+      cut?: boolean;
+      /** Another provider answered after the chosen one failed (or a model refused tools). */
+      note?: string;
+      /** The model asked for these tools; run them and send the results. */
+      calls?: ToolCall[];
+      /** The provider refused tools and answered without them. */
+      noTools?: boolean;
+    }
   | { ok: false; text: string; error: string; stopped?: boolean };
 
 /** Streams a reply from /api/chat, calling onDelta with the text so far. Abort the signal to stop. */
 export async function streamChat(
-  input: Omit<ChatInput, "messages"> & { messages: { role: string; content: string }[] },
+  input: Omit<ChatInput, "messages"> & { messages: WireMessage[] },
   { signal, onDelta, onNote }: { signal: AbortSignal; onDelta: (textSoFar: string) => void; onNote?: (note: string) => void },
 ): Promise<StreamResult> {
   let text = "";
@@ -17,9 +35,11 @@ export async function streamChat(
   let note: string | undefined;
   let finished = false;
   let status = 0;
+  const calls: ToolCall[] = [];
+  let noTools = false;
   const handle = (row: string) => {
     if (!row.trim()) return;
-    let event: { t?: string; v?: unknown; model?: unknown; cut?: unknown; provider?: unknown };
+    let event: { t?: string; v?: unknown; model?: unknown; cut?: unknown; provider?: unknown; calls?: unknown; noTools?: unknown };
     try {
       event = JSON.parse(row);
     } catch {
@@ -31,6 +51,10 @@ export async function streamChat(
     } else if (event.t === "note" && typeof event.v === "string") {
       note = event.v;
       onNote?.(event.v);
+    } else if (event.t === "tool" && Array.isArray(event.calls)) {
+      for (const call of event.calls as Partial<ToolCall>[]) {
+        if (call && typeof call.id === "string" && typeof call.name === "string") calls.push({ id: call.id, name: call.name, arguments: typeof call.arguments === "string" ? call.arguments : "" });
+      }
     } else if (event.t === "error" && typeof event.v === "string") {
       error = event.v;
     } else if (event.t === "done") {
@@ -38,6 +62,7 @@ export async function streamChat(
       if (typeof event.model === "string") model = event.model;
       if (typeof event.provider === "string") provider = event.provider;
       if (event.cut === true) truncated = true;
+      if (event.noTools === true) noTools = true;
     }
   };
   try {
@@ -74,5 +99,5 @@ export async function streamChat(
   if (error) return { ok: false, text, error };
   // Without the closing "done" event the reply was cut off (or this was not the chat endpoint answering).
   if (!finished) return { ok: false, text, error: status && status !== 200 ? `Chat link returned ${status}.` : "The reply ended before it finished (the connection was cut). What arrived is kept." };
-  return { ok: true, text, model, provider, cut: truncated, note };
+  return { ok: true, text, model, provider, cut: truncated, note, ...(calls.length ? { calls } : {}), ...(noTools ? { noTools } : {}) };
 }
