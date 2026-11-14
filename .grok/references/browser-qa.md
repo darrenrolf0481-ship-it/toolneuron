@@ -1,6 +1,6 @@
 # Browser QA (agent-driven only; the user is not your QA)
 
-`AGENTS.md` § "Execution loop" states the mandatory pass. This is the menu of
+`.grok/AGENTS.grok.md` § "Execution loop" states the mandatory pass. This is the menu of
 capabilities and the depth judgment around it.
 
 Everything here runs **in the sandbox** against `http://127.0.0.1:8080` — it is

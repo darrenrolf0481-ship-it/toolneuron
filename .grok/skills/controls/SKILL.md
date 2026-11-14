@@ -249,7 +249,7 @@ for planes assert **roll**: A ⇒ bank left.
 0.05 rad in 300 ms, which a boat or a heavy rover will do; raise the hold, or
 check the sim is running, and flip nothing. Any other non-zero exit — no probe,
 a wedged daemon — means the check never ran: read the message first. Read the
-browser-QA reference `AGENTS.md` links before your first flow — verbs, argument
+browser-QA reference `.grok/AGENTS.grok.md` links before your first flow — verbs, argument
 shapes and the fallback are there.
 
 ### 5d. What not to do

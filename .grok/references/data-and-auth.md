@@ -1,8 +1,8 @@
 # Data & auth — implementation
 
-Read this **after** `AGENTS.md` §0.5 has already said the app needs a database
+Read this **after** `.grok/AGENTS.grok.md` §0.5 has already said the app needs a database
 and/or sign-in. The decision (auth OFF by default, the closed trigger list, "no
-migrations / no `@/lib/db` unless triggered") lives in `AGENTS.md`, not here.
+migrations / no `@/lib/db` unless triggered") lives in `.grok/AGENTS.grok.md`, not here.
 
 Full guides + snippets: the **`neon` skill** (database) and the **`auth` skill**
 (sign-in), under `.grok/skills/`.
@@ -50,7 +50,7 @@ and `auth` skills.
   and `src/routes/login.tsx` (provider buttons via `signIn(providerId)`). Copy
   the snippets from the `auth` skill.
 - The live-preview popup at `/auth/popup` is served by the template Vite plugin
-  (`vite.config.ts` → `popup.server.ts`); `AGENTS.md` § "First scaffold" states
+  (`vite.config.ts` → `popup.server.ts`); `.grok/AGENTS.grok.md` § "First scaffold" states
   the rule about not adding a React route there.
 - Read the user with `useCurrentUser()` (`@/lib/auth/use-current-user`) and gate
   UI with `SignedIn` / `SignedOut` / `UserButton` (`@/lib/auth/gates`).

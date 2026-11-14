@@ -119,4 +119,4 @@ out of the pointer-lock/gameplay input path.
 - Mobile (~390px) has no overflow; targets ≥ 44px.
 - Real icons/images/charts — none of the anti-slop tells.
 - Loading/empty/error states handled; motion subtle and reduced-motion-safe.
-- Rendered and eyeballed in a browser (see AGENTS.md verification), not just curl.
+- Rendered and eyeballed in a browser (see .grok/AGENTS.grok.md verification), not just curl.

@@ -12,7 +12,7 @@ user-invocable: false
 
 # Neon Postgres
 
-**The database is opt-in** (AGENTS.md §0.5): use it only when the app needs data
+**The database is opt-in** (.grok/AGENTS.grok.md §0.5): use it only when the app needs data
 that outlives a browser session or is shared across devices. Otherwise ship no
 migrations, don't import `@/lib/db`, and keep state in `localStorage` / zustand.
 

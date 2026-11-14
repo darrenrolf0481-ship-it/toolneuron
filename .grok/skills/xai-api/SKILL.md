@@ -147,6 +147,6 @@ degrades or breaks every other use of their key. Be careful with usage:
 - **Gate expensive flows** — media generation in particular. On an app that
   already has sign-in, put them behind `authMiddleware` (see the **`auth`
   skill**). Sign-in is off by default, and adding the middleware without it
-  breaks the deployed app (AGENTS.md §0.5) — so on an app without accounts, cap
+  breaks the deployed app (.grok/AGENTS.grok.md §0.5) — so on an app without accounts, cap
   usage instead: user-initiated calls, small limits, cached results.
 - Don't add retry storms: on an API error, surface it; retry at most once.

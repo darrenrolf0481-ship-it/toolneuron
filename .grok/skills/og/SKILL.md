@@ -54,7 +54,7 @@ edit — missing it, or missing `public/x-banner.jpg` once a custom card exists,
 ## Brand-asset pass: always a subagent, never waited for
 
 **Have the `task` tool? Dispatch this pass as a subagent and never generate card art yourself** — inline it
-puts minutes of generation latency in front of the user. As soon as name and palette settle (AGENTS.md §
+puts minutes of generation latency in front of the user. As soon as name and palette settle (.grok/AGENTS.grok.md §
 "Parallel work"), dispatch this prompt verbatim. It is complete — do not open the references below to
 enrich it; the pass reads them itself:
 

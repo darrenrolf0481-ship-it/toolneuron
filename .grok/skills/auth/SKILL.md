@@ -28,7 +28,7 @@ no Google/X buttons**: `references/grok-identity.md`.
 
 **Sign-in is OFF by default** — the template ships `.grok/app-env.json` with
 `{"VITE_AUTH_ENABLED": "false"}`, so only add accounts when the ask calls for
-them (AGENTS.md §0.5). Switching it on is "Turning sign-in on" below.
+them (.grok/AGENTS.grok.md §0.5). Switching it on is "Turning sign-in on" below.
 
 **Once on, sign-in is REAL — including in the sandbox live preview.** Do **NOT**
 scaffold demo/mock/hardcoded users. Preview: popup + baked preview client;

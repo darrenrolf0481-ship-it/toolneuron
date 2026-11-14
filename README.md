@@ -188,7 +188,8 @@ needs no secrets.
 | `src/lib/crimson/vault/` | Vault crypto, passkeys, storage |
 | `src/components/crimson/` | The UI |
 | `e2e/` | Browser tests |
-| `.grok/`, `scripts/grok-*` | Grok app-builder files from the original export |
+| `AGENTS.md` (and `CLAUDE.md`) | Notes for coding agents: commands, invariants, style |
+| `.grok/`, `scripts/grok-*` | Grok app-builder files from the original export (their rules: `.grok/AGENTS.grok.md`, not used here) |
 
 ## Credits
 

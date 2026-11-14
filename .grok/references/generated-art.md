@@ -1,6 +1,6 @@
 # Generated art (2D only)
 
-`AGENTS.md` § "Skills" states the availability rule: only call `imagine_*` tools
+`.grok/AGENTS.grok.md` § "Skills" states the availability rule: only call `imagine_*` tools
 when they appear in your available tools list, and ship CSS / SVG / emoji /
 canvas / geometric-WebGL art when they don't. This file is the pipeline detail
 for when they are listed.

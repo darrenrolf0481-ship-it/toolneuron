@@ -1,6 +1,6 @@
 # Hibernate, revive, and follow-up turns
 
-`AGENTS.md` § "`/workspace/startup.sh`" holds the rules for the file itself.
+`.grok/AGENTS.grok.md` § "`/workspace/startup.sh`" holds the rules for the file itself.
 This is the surrounding lifecycle behaviour.
 
 ## Session shapes you may land in
