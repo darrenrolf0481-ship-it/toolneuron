@@ -6,14 +6,15 @@ import { languageFromName } from "./seed";
 import { session, type StoreApi } from "./store-shared";
 import type { OsState } from "./store";
 import { streamChat, type StreamResult, type WireMessage } from "./stream-chat";
-import { CHAT_TOOLS, MAX_TOOL_ROUNDS, TOOLS_RULE, toolsOn } from "./tools";
-import { runReadRound } from "./tools-run";
+import { runForAi } from "./runtime";
+import { CHAT_TOOLS, MAX_CALLS_PER_ROUND, MAX_TOOL_ROUNDS, TOOLS_RULE, toolsOn } from "./tools";
+import { declinedOutcome, parseRunCode, ranOutcome, runReadTool, skippedOutcome, type RunRequest, type ToolOutcome } from "./tools-run";
 import type { ChatMessage, ProjectFile, ToolUse } from "./types";
 
 export function chatActions(
   get: StoreApi["get"],
   set: StoreApi["set"],
-): Pick<OsState, "consult" | "stopChat" | "handOff" | "clearHandoff" | "askTerminal"> {
+): Pick<OsState, "consult" | "answerTool" | "stopChat" | "handOff" | "clearHandoff" | "askTerminal"> {
   return {
   consult: async (prompt) => {
     const text = prompt.trim();
@@ -48,6 +49,23 @@ export function chatActions(
         );
         set({ chat: [...chat, ...extra] });
       };
+      /** Shows the Run / Skip card and waits. Stop (or reset) answers "stopped". */
+      const askToRun = (callId: string, request: RunRequest) =>
+        new Promise<boolean | "stopped">((resolve) => {
+          if (controller.signal.aborted) return resolve("stopped");
+          const onAbort = () => {
+            session.answerTool = null;
+            set({ toolApproval: null });
+            resolve("stopped");
+          };
+          controller.signal.addEventListener("abort", onAbort, { once: true });
+          session.answerTool = (run) => {
+            controller.signal.removeEventListener("abort", onAbort);
+            session.answerTool = null;
+            resolve(run);
+          };
+          set({ toolApproval: { replyAt: startedAt, callId, ...request } });
+        });
       // Tool rounds: the model may ask for tools; they run here and the results go back, up to MAX_TOOL_ROUNDS.
       const useTools = toolsOn(activePersonality(get().personalities)) && !fileMatch;
       let offered = useTools;
@@ -81,12 +99,43 @@ export function chatActions(
         if (!result.ok) break;
         if (result.noTools) offered = false;
         if (!result.calls?.length || !offered || last) break;
-        const state = get();
-        const outcomes = runReadRound({ files: state.files, activeFileId: state.activeFileId, draft: state.draft, packs: state.packs }, result.calls, CHAT_TOOLS);
-        uses.push(...outcomes.map((outcome) => outcome.use));
         if (result.text.trim()) earlier.push(result.text.trim());
+        patchReply({ text: shown("") });
+        const outcomes: ToolOutcome[] = [];
+        for (const [index, call] of result.calls.entries()) {
+          let outcome: ToolOutcome;
+          if (index >= MAX_CALLS_PER_ROUND) {
+            outcome = skippedOutcome(call);
+          } else if (call.name === "run_code") {
+            const request = parseRunCode(call, CHAT_TOOLS);
+            if ("message" in request) {
+              outcome = request;
+            } else {
+              // Nothing runs until the user presses Run on the card.
+              const answer = await askToRun(call.id, request);
+              if (startedIn !== session.generation) return;
+              if (answer === "stopped") break;
+              if (answer) {
+                set({ toolApproval: { replyAt: startedAt, callId: call.id, ...request, running: true } });
+                const output = await runForAi(request.language, request.code);
+                if (startedIn !== session.generation) return;
+                outcome = ranOutcome(call, request, output);
+              } else {
+                outcome = declinedOutcome(call, request);
+              }
+              set({ toolApproval: null });
+            }
+          } else {
+            const state = get();
+            outcome = runReadTool({ files: state.files, activeFileId: state.activeFileId, draft: state.draft, packs: state.packs }, call, CHAT_TOOLS);
+          }
+          outcomes.push(outcome);
+          uses.push(outcome.use);
+          patchReply({ tools: [...uses] });
+          if (controller.signal.aborted) break;
+        }
+        // After Stop, the next request ends at once as stopped.
         wire.push({ role: "assistant", content: result.text, tool_calls: result.calls }, ...outcomes.map((outcome) => outcome.message));
-        patchReply({ text: shown(""), tools: [...uses] });
       }
       const toolsPatch = uses.length ? { tools: uses } : {};
       if (result.ok && !shown(result.text).trim()) {
@@ -134,8 +183,13 @@ export function chatActions(
           { role: "ai", text: "The link dropped before a reply landed.", timestamp: Date.now(), error: true },
         ],
         busy: false,
+        toolApproval: null,
       });
     }
+  },
+
+  answerTool: (run) => {
+    session.answerTool?.(run);
   },
 
   stopChat: () => {

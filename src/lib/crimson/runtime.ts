@@ -136,6 +136,27 @@ function runJs(code: string): Promise<string> {
   });
 }
 
+/**
+ * Runs code the chat AI wrote (after the user approved it). JavaScript gets a
+ * fresh sandbox per run as always; Python runs in the AI's own interpreter.
+ * No python-lite fallback: the AI must not mistake echoed prints for output.
+ */
+export async function runForAi(language: "javascript" | "python", code: string, onStatus?: (line: string) => void): Promise<string> {
+  if (language === "javascript") return runJs(code);
+  if (typeof document === "undefined") return "[ERROR] The runner needs a browser.";
+  const result = await runPyodide(code, onStatus, "ai");
+  if (result.loadFailed) return `[ERROR] Python could not be loaded (${result.error ?? "load failed"}), so the code was not run.`;
+  return pythonOutput(result);
+}
+
+function pythonOutput(result: { logs: string[]; error: string | null; timeout: boolean }): string {
+  const out = [...result.logs];
+  if (result.timeout) out.push(`[ERROR] Stopped after ${PY_LIMIT_SECONDS}s. Infinite loop?`);
+  else if (result.error) out.push(`[ERROR] ${result.error.trim()}`);
+  else out.push(out.length === 0 ? "[SUCCESS] Exited 0. No stdout." : "[SUCCESS] Exited 0.");
+  return out.join("\n");
+}
+
 async function runPython(code: string, onStatus?: (line: string) => void): Promise<string> {
   if (typeof document === "undefined") return "[ERROR] The runner needs a browser.";
   const result = await runPyodide(code, onStatus);
@@ -145,11 +166,7 @@ async function runPython(code: string, onStatus?: (line: string) => void): Promi
       runPythonLite(code),
     ].join("\n");
   }
-  const out = [...result.logs];
-  if (result.timeout) out.push(`[ERROR] Stopped after ${PY_LIMIT_SECONDS}s. Infinite loop?`);
-  else if (result.error) out.push(`[ERROR] ${result.error.trim()}`);
-  else out.push(out.length === 0 ? "[SUCCESS] Exited 0. No stdout." : "[SUCCESS] Exited 0.");
-  return out.join("\n");
+  return pythonOutput(result);
 }
 
 /** Offline fallback: echoes print() literals only. It does not execute code. */

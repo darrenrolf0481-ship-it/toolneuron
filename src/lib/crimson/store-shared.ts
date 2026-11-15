@@ -23,6 +23,8 @@ export const session = {
   chatAbort: null as AbortController | null,
   /** Bumped when the workspace is replaced (reset, import), so late replies cannot write into the new one. */
   generation: 0,
+  /** Answers the open "run this code?" card: true = Run, false = Skip. */
+  answerTool: null as ((run: boolean) => void) | null,
 };
 
 /** Cancels chat and swarm work and makes any reply still on its way stale. */
@@ -62,6 +64,7 @@ export function fresh(): Pick<
   | "editorMode"
   | "outputs"
   | "savedAt"
+  | "toolApproval"
 > {
   const brain = SEED_FILES.find((file) => file.id === "brain");
   return {
@@ -103,6 +106,7 @@ export function fresh(): Pick<
     editorMode: "code",
     outputs: {},
     savedAt: "",
+    toolApproval: null,
   };
 }
 

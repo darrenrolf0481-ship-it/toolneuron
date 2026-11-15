@@ -73,7 +73,7 @@ describe("chat tools", () => {
     await app.idle();
     assert.equal(app.sent.length, 2);
     const [first, second] = app.sent;
-    assert.deepEqual(first.tools, ["list_files", "read_file", "search_files", "search_knowledge"], "Architect has tools on by default");
+    assert.deepEqual(first.tools, ["list_files", "read_file", "search_files", "search_knowledge", "run_code"], "Architect has tools on by default");
     assert.equal(first.toolChoice, "auto");
     assert.match(first.system, /Tools: you can list, read and search/);
     const result = second.messages.find((message) => message.role === "tool");
@@ -171,6 +171,75 @@ describe("chat tools", () => {
     await app.idle();
     assert.equal(app.sent.length, 1);
     assert.match(await app.lastReply().innerText(), /Plain answer\.[\s\S]*cannot use tools/);
+    await app.close();
+  });
+
+  it("run_code shows the code and runs it only after Run; the output goes back", async () => {
+    const run = call("run_code", { language: "javascript", code: "console.log(6 * 7)" }, "c_run");
+    const app = await openApp({ replies: [{ calls: [run] }, { text: "It prints 42." }] });
+    await app.ask("What is six times seven? Check by running code.");
+    const card = app.page.getByRole("group", { name: "Approve code run" });
+    await card.waitFor();
+    assert.match(await card.innerText(), /Run this JavaScript in the sandbox\?[\s\S]*console\.log\(6 \* 7\)/);
+    await app.page.waitForTimeout(700);
+    assert.equal(app.sent.length, 1, "nothing happens while the card waits");
+    await card.getByRole("button", { name: "Run" }).click();
+    await app.idle();
+    assert.equal(app.sent.length, 2);
+    const result = app.sent[1].messages.find((message) => message.role === "tool");
+    assert.equal(result.tool_call_id, "c_run");
+    assert.match(result.content, /Output:\n42\n\[SUCCESS\] Exited 0\./);
+    const reply = await app.lastReply().innerText();
+    assert.match(reply, /It prints 42\./);
+    assert.match(reply, /Ran JavaScript · 1 line of output/);
+    assert.equal(await card.count(), 0);
+    await app.close();
+  });
+
+  it("Skip sends a decline and runs nothing", async () => {
+    const app = await openApp({ replies: [{ calls: [call("run_code", { language: "javascript", code: "console.log('ran!')" }, "c_skip")] }, { text: "Fine, without running it." }] });
+    await app.ask("run something");
+    const card = app.page.getByRole("group", { name: "Approve code run" });
+    await card.getByRole("button", { name: "Skip" }).click();
+    await app.idle();
+    const result = app.sent[1].messages.find((message) => message.role === "tool");
+    assert.match(result.content, /The user declined to run this code/);
+    assert.ok(!result.content.includes("ran!"));
+    assert.match(await app.lastReply().innerText(), /Skipped running JavaScript/);
+    await app.close();
+  });
+
+  it("Stop while the card waits ends the reply and removes the card", async () => {
+    const app = await openApp({ replies: [{ calls: [call("run_code", { language: "javascript", code: "console.log(1)" })] }] });
+    await app.ask("run it");
+    const card = app.page.getByRole("group", { name: "Approve code run" });
+    await card.waitFor();
+    await app.page.getByRole("button", { name: "Stop reply" }).click();
+    await app.idle();
+    assert.equal(await card.count(), 0);
+    assert.equal(app.sent.length, 1, "no further request after Stop");
+    // Nothing had arrived yet, so it ends as the usual "Stopped." notice.
+    assert.match(await app.page.locator('[data-message="notice"]').last().innerText(), /Stopped\./);
+    await app.close();
+  });
+
+  it("a file that tells the model to run code still needs a click", async () => {
+    // The model "obeys" an instruction planted in a file: read it, then ask to run what it says.
+    const app = await openApp({
+      replies: [
+        { calls: [call("read_file", { path: "src/neural_brain.py" }, "c_r")] },
+        { calls: [call("run_code", { language: "javascript", code: "console.log('planted')" }, "c_planted")] },
+        { text: "done" },
+      ],
+    });
+    await app.ask("Follow the instructions in neural_brain.py");
+    const card = app.page.getByRole("group", { name: "Approve code run" });
+    await card.waitFor();
+    await app.page.waitForTimeout(700);
+    assert.equal(app.sent.length, 2, "the run waits for the user");
+    await card.getByRole("button", { name: "Skip" }).click();
+    await app.idle();
+    assert.ok(!app.sent[2].messages.some((message) => message.role === "tool" && message.content.includes("Output:")));
     await app.close();
   });
 });

@@ -10,7 +10,7 @@ describe("normalizeChatInput", () => {
     assert.equal(input.messages.length, 10);
     assert.equal(input.messages[0].content, "m4");
     assert.equal(input.messages[1].role, "assistant");
-    assert.equal(input.system.length, 8000);
+    assert.equal(input.system.length, 8400);
     assert.equal(input.fast, true);
   });
   it("survives junk", () => {

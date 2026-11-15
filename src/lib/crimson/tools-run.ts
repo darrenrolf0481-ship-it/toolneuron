@@ -187,14 +187,72 @@ export function runReadTool(world: ToolWorld, call: ToolCall, offered: readonly 
   }
 }
 
-/** Runs a round of calls; calls beyond the per-round limit are answered with an error (every call needs a result). */
+/** The answer for a call over the per-round limit (every call needs a result). */
+export function skippedOutcome(call: ToolCall): ToolOutcome {
+  const error = `at most ${MAX_CALLS_PER_ROUND} tool calls per round; this one was not run`;
+  return {
+    message: { role: "tool", tool_call_id: call.id, content: wrapResult(call.name, error, false) },
+    use: { id: call.id, name: call.name, args: call.arguments.slice(0, 200), summary: `${call.name} skipped: over ${MAX_CALLS_PER_ROUND} calls`, result: "not run", status: "error" },
+  };
+}
+
+/** Runs a round of read-only calls; calls beyond the per-round limit are answered with an error. */
 export function runReadRound(world: ToolWorld, calls: ToolCall[], offered: readonly ToolName[]): ToolOutcome[] {
-  return calls.map((call, index): ToolOutcome => {
-    if (index < MAX_CALLS_PER_ROUND) return runReadTool(world, call, offered);
-    const error = `at most ${MAX_CALLS_PER_ROUND} tool calls per round; this one was not run`;
-    return {
-      message: { role: "tool", tool_call_id: call.id, content: wrapResult(call.name, error, false) },
-      use: { id: call.id, name: call.name, args: call.arguments.slice(0, 200), summary: `${call.name} skipped: over ${MAX_CALLS_PER_ROUND} calls`, result: "not run", status: "error" },
-    };
+  return calls.map((call, index) => (index < MAX_CALLS_PER_ROUND ? runReadTool(world, call, offered) : skippedOutcome(call)));
+}
+
+// ---- run_code: checked here, approved by the user, run by runtime.ts ----
+
+export const MAX_RUN_CODE = 20_000;
+export type RunRequest = { language: "javascript" | "python"; code: string };
+const LANGUAGE_NAME = { javascript: "JavaScript", python: "Python" } as const;
+
+/** Checks a run_code call. Returns what to show on the approval card, or the error answer. */
+export function parseRunCode(call: ToolCall, offered: readonly ToolName[]): RunRequest | ToolOutcome {
+  const args = call.arguments.length > 200 ? `${call.arguments.slice(0, 200)}…` : call.arguments;
+  const fail = (error: string): ToolOutcome => ({
+    message: { role: "tool", tool_call_id: call.id, content: wrapResult(call.name, error, false) },
+    use: { id: call.id, name: call.name, args, summary: `run_code failed: ${error}`.slice(0, 160), result: error, status: "error" },
   });
+  if (!offered.includes("run_code")) return fail(`there is no tool named "run_code" here`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(call.arguments || "{}");
+  } catch {
+    return fail("the arguments are not valid JSON");
+  }
+  const raw = (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, unknown>;
+  const language = typeof raw.language === "string" ? raw.language.toLowerCase().trim() : "";
+  const normalized = language === "js" || language === "javascript" ? "javascript" : language === "py" || language === "python" ? "python" : null;
+  if (!normalized) return fail('language must be "javascript" or "python"');
+  if (typeof raw.code !== "string" || !raw.code.trim()) return fail("code is required");
+  if (raw.code.length > MAX_RUN_CODE) return fail(`the code is longer than ${MAX_RUN_CODE} characters`);
+  return { language: normalized, code: raw.code };
+}
+
+const shortCode = (request: RunRequest) => `${request.language}: ${request.code.slice(0, 180)}${request.code.length > 180 ? "…" : ""}`;
+
+/** The answer after an approved run. */
+export function ranOutcome(call: ToolCall, request: RunRequest, output: string): ToolOutcome {
+  const failed = /^\[ERROR\]/m.test(output);
+  const lines = output.split("\n").filter((line) => line.trim() && !line.startsWith("[SUCCESS]")).length;
+  return {
+    message: { role: "tool", tool_call_id: call.id, content: wrapResult("run_code", `Output:\n${output}`, true) },
+    use: {
+      id: call.id,
+      name: "run_code",
+      args: shortCode(request),
+      summary: `Ran ${LANGUAGE_NAME[request.language]} · ${failed ? "error" : lines ? `${lines} line${lines === 1 ? "" : "s"} of output` : "no output"}`,
+      result: output.slice(0, SAVED_RESULT_CHARS),
+      status: "done",
+    },
+  };
+}
+
+/** The answer when the user pressed Skip. */
+export function declinedOutcome(call: ToolCall, request: RunRequest): ToolOutcome {
+  return {
+    message: { role: "tool", tool_call_id: call.id, content: wrapResult("run_code", "The user declined to run this code. Do not ask to run it again unless they ask; answer without it.", false) },
+    use: { id: call.id, name: "run_code", args: shortCode(request), summary: `Skipped running ${LANGUAGE_NAME[request.language]}`, result: "Declined by you.", status: "declined" },
+  };
 }

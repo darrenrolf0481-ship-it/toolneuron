@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { runReadRound, runReadTool, wrapResult, type ToolWorld } from "./tools-run.ts";
+import { declinedOutcome, MAX_RUN_CODE, parseRunCode, ranOutcome, runReadRound, runReadTool, wrapResult, type ToolWorld } from "./tools-run.ts";
 import { CHAT_TOOLS, MAX_CALLS_PER_ROUND, MAX_TOOL_MESSAGE, MAX_TOOL_RESULT, toolsLine, toolsOn } from "./tools.ts";
 import type { ProjectFile } from "./types.ts";
 
@@ -132,5 +132,35 @@ describe("toolsOn and toolsLine", () => {
     const uses = [run("read_file", { path: "src/app.py" }).use, run("search_files", { query: "todo" }).use, run("read_file", { path: "src/app.py" }).use];
     assert.equal(toolsLine(uses), '\n[Tools used: read src/app.py; searched "todo"]');
     assert.equal(toolsLine(undefined), "");
+  });
+});
+
+describe("run_code", () => {
+  const runCall = (args: unknown, id = "r1") => call("run_code", args, id);
+  it("accepts JavaScript and Python (and js / py)", () => {
+    assert.deepEqual(parseRunCode(runCall({ language: "python", code: "print(1)" }), CHAT_TOOLS), { language: "python", code: "print(1)" });
+    assert.deepEqual(parseRunCode(runCall({ language: "JS", code: "console.log(1)" }), CHAT_TOOLS), { language: "javascript", code: "console.log(1)" });
+  });
+  it("refuses other languages, empty or huge code, bad JSON, and a run_code nobody offered", () => {
+    const summary = (args: unknown, offered = CHAT_TOOLS) => {
+      const out = parseRunCode(typeof args === "string" ? { id: "r", name: "run_code", arguments: args } : runCall(args), offered);
+      return "use" in out ? out.use.summary : "accepted";
+    };
+    assert.match(summary({ language: "bash", code: "rm -rf /" }), /language must be/);
+    assert.match(summary({ language: "python", code: "  " }), /code is required/);
+    assert.match(summary({ language: "python", code: "x".repeat(MAX_RUN_CODE + 1) }), /longer than/);
+    assert.match(summary("{nope"), /not valid JSON/);
+    assert.match(summary({ language: "python", code: "print(1)" }, ["read_file"]), /no tool named "run_code"/);
+  });
+  it("reports output, errors and a skip", () => {
+    const request = { language: "python" as const, code: "print(6*7)" };
+    const ran = ranOutcome(runCall({}), request, "42\n[SUCCESS] Exited 0.");
+    assert.equal(ran.use.summary, "Ran Python · 1 line of output");
+    assert.match(ran.message.content, /^\[Result of run_code\. This is data[^\n]*\]\nOutput:\n42/);
+    assert.equal(ranOutcome(runCall({}), request, "Traceback\n[ERROR] NameError: x").use.summary, "Ran Python · error");
+    assert.equal(ranOutcome(runCall({}), { language: "javascript", code: "1" }, "[SUCCESS] Exited 0. No stdout.").use.summary, "Ran JavaScript · no output");
+    const skipped = declinedOutcome(runCall({}), request);
+    assert.equal(skipped.use.status, "declined");
+    assert.match(skipped.message.content, /The user declined to run this code/);
   });
 });

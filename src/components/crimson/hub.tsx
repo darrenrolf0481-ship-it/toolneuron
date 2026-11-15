@@ -81,6 +81,7 @@ function ChatPane() {
   const handOff = useOs((state) => state.handOff);
   const fast = useOs((state) => state.fast);
   const clearHandoff = useOs((state) => state.clearHandoff);
+  const awaitingRun = useOs((state) => Boolean(state.toolApproval && !state.toolApproval.running));
   const note = useOs((state) => findHandoff(state.files));
   const noteText = useOs((state) => (note && state.activeFileId === note.id ? state.draft : note?.content) ?? "");
   const [text, setText] = useState("");
@@ -118,9 +119,12 @@ function ChatPane() {
                   {message.text ? (
                     <Rich text={message.text} />
                   ) : (
-                    <p className="text-sm text-muted">{message.pending && message.tools?.length ? "Looking at the project…" : "…"}</p>
+                    <p className="text-sm text-muted">
+                      {message.pending && awaitingRun ? "Waiting for you to choose Run or Skip." : message.pending && message.tools?.length ? "Looking at the project…" : "…"}
+                    </p>
                   )}
                   {message.tools && message.tools.length > 0 && <ToolChips uses={message.tools} />}
+                  {message.pending && <RunCard replyAt={message.timestamp} />}
                   {message.pending && message.text && <span className="os-caret" aria-hidden />}
                   {message.stopped && <p className="mt-1 text-[11px] tracking-wide text-muted uppercase">Stopped</p>}
                   {message.note && (
@@ -171,7 +175,7 @@ function ChatPane() {
             </div>
           </div>
         ))}
-        {busy && !chat.some((message) => message.pending && message.text) && (
+        {busy && !awaitingRun && !chat.some((message) => message.pending && message.text) && (
           <p className="text-xs tracking-widest text-muted uppercase" role="status">
             Holding the link…
           </p>
@@ -243,6 +247,35 @@ function ChatPane() {
           </button>
         )}
       </form>
+    </div>
+  );
+}
+
+/** The AI asked to run code: show exactly what, and run it only on Run. */
+function RunCard({ replyAt }: { replyAt: number }) {
+  const approval = useOs((state) => state.toolApproval);
+  const answer = useOs((state) => state.answerTool);
+  if (!approval || approval.replyAt !== replyAt) return null;
+  const language = approval.language === "python" ? "Python" : "JavaScript";
+  return (
+    <div role="group" aria-label="Approve code run" className="mt-2 rounded-2xl border border-primary/60 bg-bg p-3 text-xs">
+      <p className="font-semibold text-fg">Run this {language} in the sandbox?</p>
+      <p className="mt-1 text-[11px] text-muted">Isolated: no network, no access to your files or this app. Its output goes back to the AI.</p>
+      <pre className="os-scroll mt-2 max-h-64 overflow-auto rounded-xl border border-border p-2 font-mono text-[11px] leading-4 whitespace-pre text-fg">{approval.code}</pre>
+      {approval.running ? (
+        <p className="mt-2 text-[11px] text-muted" role="status">
+          Running…{approval.language === "python" ? " (the first Python run downloads about 12 MB)" : ""}
+        </p>
+      ) : (
+        <div className="mt-2 flex gap-2">
+          <button type="button" onClick={() => answer(true)} className="min-h-9 rounded-full bg-primary px-4 font-semibold text-on-primary">
+            Run
+          </button>
+          <button type="button" onClick={() => answer(false)} className="min-h-9 rounded-full border border-border px-4 text-fg">
+            Skip
+          </button>
+        </div>
+      )}
     </div>
   );
 }

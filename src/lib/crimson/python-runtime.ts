@@ -140,97 +140,117 @@ parent.postMessage({ ready: true }, "*");
 
 export type PyResult = { logs: string[]; error: string | null; timeout: boolean; loadFailed: boolean };
 
-let frame: HTMLIFrameElement | null = null;
-let ready: Promise<void> | null = null;
-let queue: Promise<unknown> = Promise.resolve();
+/**
+ * One isolated Python interpreter (its own iframe and worker). Programs run
+ * one at a time. The editor and terminal share one; code the chat AI runs
+ * gets another, so nothing it imports or writes can change your own runs.
+ */
+export class PySandbox {
+  private frame: HTMLIFrameElement | null = null;
+  private ready: Promise<void> | null = null;
+  private queue: Promise<unknown> = Promise.resolve();
 
-function ensureFrame(): Promise<void> {
-  if (frame?.isConnected && ready) return ready;
-  frame?.remove();
-  const el = document.createElement("iframe");
-  el.setAttribute("sandbox", "allow-scripts");
-  el.setAttribute("aria-hidden", "true");
-  el.tabIndex = -1;
-  el.style.cssText = "position:fixed;width:0;height:0;border:0;opacity:0;pointer-events:none";
-  el.srcdoc = HOST_HTML;
-  frame = el;
-  ready = new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      window.removeEventListener("message", onReady);
-      reject(new Error("The Python sandbox did not start."));
-    }, 10_000);
-    const onReady = (event: MessageEvent) => {
-      if (event.source !== el.contentWindow || !(event.data as { ready?: boolean } | null)?.ready) return;
-      clearTimeout(timer);
-      window.removeEventListener("message", onReady);
-      resolve();
-    };
-    window.addEventListener("message", onReady);
-  });
-  document.body.appendChild(el);
-  ready.catch(() => {
-    el.remove();
-    if (frame === el) frame = null;
-    ready = null;
-  });
-  return ready;
-}
+  private ensureFrame(): Promise<void> {
+    if (this.frame?.isConnected && this.ready) return this.ready;
+    this.frame?.remove();
+    const el = document.createElement("iframe");
+    el.setAttribute("sandbox", "allow-scripts");
+    el.setAttribute("aria-hidden", "true");
+    el.tabIndex = -1;
+    el.style.cssText = "position:fixed;width:0;height:0;border:0;opacity:0;pointer-events:none";
+    el.srcdoc = HOST_HTML;
+    this.frame = el;
+    const ready = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        window.removeEventListener("message", onReady);
+        reject(new Error("The Python sandbox did not start."));
+      }, 10_000);
+      const onReady = (event: MessageEvent) => {
+        if (event.source !== el.contentWindow || !(event.data as { ready?: boolean } | null)?.ready) return;
+        clearTimeout(timer);
+        window.removeEventListener("message", onReady);
+        resolve();
+      };
+      window.addEventListener("message", onReady);
+    });
+    this.ready = ready;
+    document.body.appendChild(el);
+    ready.catch(() => {
+      el.remove();
+      if (this.frame === el) {
+        this.frame = null;
+        this.ready = null;
+      }
+    });
+    return ready;
+  }
 
-function runOnce(code: string, onStatus?: (line: string) => void): Promise<PyResult> {
-  return ensureFrame().then(
-    () =>
-      new Promise<PyResult>((resolve) => {
-        const el = frame!;
-        const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        const done = (result: PyResult) => {
-          window.removeEventListener("message", onMessage);
-          clearTimeout(guard);
-          resolve(result);
-        };
-        const onMessage = (event: MessageEvent) => {
-          if (event.source !== el.contentWindow) return;
-          const data = event.data as {
-            id?: string; status?: unknown; done?: boolean; logs?: unknown; error?: unknown; timeout?: unknown; loadFailed?: unknown;
-          } | null;
-          if (!data || data.id !== id) return;
-          if (typeof data.status === "string" && !data.done) {
-            onStatus?.(`[RUNTIME] ${data.status.slice(0, 200)}`);
-            return;
-          }
-          if (!data.done) return;
-          done({
-            logs: Array.isArray(data.logs) ? data.logs.map(String).slice(0, 2000) : [],
-            error: typeof data.error === "string" ? data.error.slice(0, 4000) : null,
-            timeout: data.timeout === true,
-            loadFailed: data.loadFailed === true,
-          });
-        };
-        const guard = setTimeout(() => {
-          // Frame wedged: throw it away so the next run starts clean.
-          el.remove();
-          if (frame === el) {
-            frame = null;
-            ready = null;
-          }
-          done({ logs: [], error: "The Python sandbox stopped responding.", timeout: false, loadFailed: true });
-        }, PY_LOAD_TIMEOUT_MS + PY_EXEC_TIMEOUT_MS + 5000);
-        window.addEventListener("message", onMessage);
-        el.contentWindow?.postMessage({ id, code }, "*");
+  private runOnce(code: string, onStatus?: (line: string) => void): Promise<PyResult> {
+    return this.ensureFrame().then(
+      () =>
+        new Promise<PyResult>((resolve) => {
+          const el = this.frame!;
+          const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          const done = (result: PyResult) => {
+            window.removeEventListener("message", onMessage);
+            clearTimeout(guard);
+            resolve(result);
+          };
+          const onMessage = (event: MessageEvent) => {
+            if (event.source !== el.contentWindow) return;
+            const data = event.data as {
+              id?: string; status?: unknown; done?: boolean; logs?: unknown; error?: unknown; timeout?: unknown; loadFailed?: unknown;
+            } | null;
+            if (!data || data.id !== id) return;
+            if (typeof data.status === "string" && !data.done) {
+              onStatus?.(`[RUNTIME] ${data.status.slice(0, 200)}`);
+              return;
+            }
+            if (!data.done) return;
+            done({
+              logs: Array.isArray(data.logs) ? data.logs.map(String).slice(0, 2000) : [],
+              error: typeof data.error === "string" ? data.error.slice(0, 4000) : null,
+              timeout: data.timeout === true,
+              loadFailed: data.loadFailed === true,
+            });
+          };
+          const guard = setTimeout(() => {
+            // Frame wedged: throw it away so the next run starts clean.
+            el.remove();
+            if (this.frame === el) {
+              this.frame = null;
+              this.ready = null;
+            }
+            done({ logs: [], error: "The Python sandbox stopped responding.", timeout: false, loadFailed: true });
+          }, PY_LOAD_TIMEOUT_MS + PY_EXEC_TIMEOUT_MS + 5000);
+          window.addEventListener("message", onMessage);
+          el.contentWindow?.postMessage({ id, code }, "*");
+        }),
+      (error: unknown) => ({
+        logs: [],
+        error: error instanceof Error ? error.message : String(error),
+        timeout: false,
+        loadFailed: true,
       }),
-    (error: unknown) => ({
-      logs: [],
-      error: error instanceof Error ? error.message : String(error),
-      timeout: false,
-      loadFailed: true,
-    }),
-  );
+    );
+  }
+
+  /** Runs one program at a time in this interpreter. */
+  run(code: string, onStatus?: (line: string) => void): Promise<PyResult> {
+    const next = this.queue.then(() => this.runOnce(code, onStatus));
+    this.queue = next.catch(() => undefined);
+    return next;
+  }
 }
 
-/** Runs one program at a time (editor and terminal share the interpreter). */
-export function runPyodide(code: string, onStatus?: (line: string) => void): Promise<PyResult> {
-  const next = queue.then(() => runOnce(code, onStatus));
-  queue = next.catch(() => undefined);
-  return next;
+/** The editor's and terminal's interpreter. */
+const editorPython = new PySandbox();
+/** The chat AI's interpreter: separate, so its imports and files never reach the editor's runs. */
+const aiPython = new PySandbox();
+
+/** Runs Python in the editor/terminal interpreter, or (`ai`) in the chat AI's own one. */
+export function runPyodide(code: string, onStatus?: (line: string) => void, sandbox: "editor" | "ai" = "editor"): Promise<PyResult> {
+  return (sandbox === "ai" ? aiPython : editorPython).run(code, onStatus);
 }
 
 export const PY_LIMIT_SECONDS = PY_EXEC_TIMEOUT_MS / 1000;

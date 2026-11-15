@@ -40,7 +40,7 @@ export type ToolUse = {
   summary: string;
   /** What was sent back to the model (shortened for saving). */
   result: string;
-  status: "done" | "error";
+  status: "done" | "error" | "declined";
 };
 
 export type ChatMessage = {

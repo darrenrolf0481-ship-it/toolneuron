@@ -117,7 +117,8 @@ export function normalizeChatInput(input: unknown): ChatInput {
   const tools = Array.isArray(raw.tools) ? [...new Set(raw.tools.filter(isToolName))] : [];
   return {
     messages,
-    system: String(raw.system ?? "").slice(0, 8000),
+    // The prompt budget (7,800) plus the tools note.
+    system: String(raw.system ?? "").slice(0, 8400),
     fast: Boolean(raw.fast),
     provider: typeof raw.provider === "string" ? raw.provider.slice(0, 32) : undefined,
     ...(tools.length ? { tools, toolChoice: raw.toolChoice === "none" ? ("none" as const) : ("auto" as const) } : {}),

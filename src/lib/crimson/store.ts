@@ -76,6 +76,8 @@ export type OsState = {
   outputs: Record<string, string>;
   busy: boolean;
   savedAt: string;
+  /** A code run the chat AI asked for, waiting for Run or Skip (not saved). */
+  toolApproval: { replyAt: number; callId: string; language: "javascript" | "python"; code: string; running?: boolean } | null;
   /** Set when localStorage refuses a save (quota). */
   saveError: string | null;
   setTab: (tab: Tab) => void;
@@ -131,6 +133,8 @@ export type OsState = {
   addStorage: (items: StorageItem[]) => void;
   removeStorage: (id: string) => void;
   consult: (prompt: string) => Promise<void>;
+  /** Answers the open code-run card: true runs it, false skips it. */
+  answerTool: (run: boolean) => void;
   stopChat: () => void;
   /** Saves an AI reply as handoff.md, pinned into later prompts. */
   handOff: (timestamp: number) => void;
